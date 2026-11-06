@@ -32,3 +32,46 @@ export function shouldCompact(input: { contextTokens?: number; estimatedBytes: n
   const threshold = Math.min(ceiling, positive(input.floor) ? Math.max(input.budget, input.floor * 1.25) : input.budget);
   return size >= threshold;
 }
+export const TOOL_OUTPUT_DEFAULT_CHARS = 8_000;
+export const TOOL_OUTPUT_MIN_CHARS = 1_000;
+export const TOOL_OUTPUT_MAX_CHARS = 8_000;
+const TOOL_OUTPUT_BUDGET_SHARE = 0.05;
+
+export type BudgetedHookPreviewInput = {
+  contextWindowTokens?: number | null;
+  reservedOutputTokens?: number | null;
+  outputReserveTokens?: number | null;
+  usedTokens?: number;
+};
+
+export function budgetedToolOutputChars(
+  budget: { contextWindowTokens?: number | null; reservedOutputTokens?: number | null; outputReserveTokens?: number | null } | null | undefined,
+  usedTokens?: number,
+): number {
+  const window = budget?.contextWindowTokens;
+  if (!window || !Number.isFinite(window)) return TOOL_OUTPUT_DEFAULT_CHARS;
+  const rawReserve = budget?.reservedOutputTokens ?? budget?.outputReserveTokens ?? 0;
+  const reserve = Number.isFinite(rawReserve) && rawReserve > 0 ? rawReserve : 0;
+  const used = typeof usedTokens === "number" && Number.isFinite(usedTokens) && usedTokens > 0 ? usedTokens : 0;
+  // Bytes end-to-end: 4 bytes/token consistently; return is bytes (== chars for ASCII).
+  const windowBytes = window * 4;
+  const reserveBytes = reserve * 4;
+  const usedBytes = used * 4;
+  const headroomBytes = Math.max(0, windowBytes - reserveBytes - usedBytes);
+  const bytes = Math.floor(headroomBytes * TOOL_OUTPUT_BUDGET_SHARE);
+  if (!Number.isFinite(bytes)) return TOOL_OUTPUT_DEFAULT_CHARS;
+  // ponytail: cap scales with the window; fixed 8k clipped large windows. Raise cap when share changes.
+  const maxForWindow = Math.max(TOOL_OUTPUT_MAX_CHARS, Math.floor(windowBytes * TOOL_OUTPUT_BUDGET_SHARE));
+  return Math.min(maxForWindow, Math.max(TOOL_OUTPUT_MIN_CHARS, bytes));
+}
+
+export function budgetedHookPreviewChars(
+  budget: { contextWindowTokens?: number | null; reservedOutputTokens?: number | null; outputReserveTokens?: number | null } | null | undefined,
+  usedTokens?: number,
+): number {
+  const window = budget?.contextWindowTokens;
+  const windowBytes = typeof window === "number" && Number.isFinite(window) ? window * 4 : 0;
+  const maxForWindow = Math.max(16_000, Math.floor(windowBytes * TOOL_OUTPUT_BUDGET_SHARE) * 2);
+  return Math.min(maxForWindow, Math.max(2_000, budgetedToolOutputChars(budget, usedTokens) * 2));
+}
+// ponytail: MAX is fixed at 128_000 chars (~512kB budget). If smaller windows matter, scale MAX from window; keep literals for now. 8000/16000 previews unchanged.

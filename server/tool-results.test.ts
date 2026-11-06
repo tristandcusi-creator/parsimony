@@ -1,5 +1,8 @@
+import { mkdtempSync, rmSync, statSync, writeFileSync, utimesSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { ToolResults, TOOL_RESULT_MAX_CHARS, TOOL_RESULT_PREVIEW_CHARS, TOOL_RESULT_TTL_MS } from "./tool-results.ts";
+import { clearSpillHashCache, pruneSpills, readSpilledToolOutput, spillHashCacheSize, spillToolOutput, ToolResults, TOOL_RESULT_MAX_CHARS, TOOL_RESULT_PREVIEW_CHARS, TOOL_RESULT_TTL_MS } from "./tool-results.ts";
 
 const owner = { botId: "a", threadId: "chat" };
 
@@ -74,5 +77,119 @@ describe("temporary agent tool results", () => {
     const oldest = results.save({ botId: "global", threadId: "old" }, text);
     for (let i = 0; i < 43; i++) results.save({ botId: "global", threadId: String(i) }, text);
     expect(results.read({ botId: "global", threadId: "old" }, oldest.id, 0)).toBeNull();
+  });
+});
+
+describe("spilled tool output", () => {
+  const tempDir = () => mkdtempSync(join(tmpdir(), "vox-spill-"));
+  const roundTrip = (dir: string, text: string, limit: number) => {
+    const spill = spillToolOutput(dir, text, true, null, 80);
+    let offset = 0; let acc = ""; let fffd = false; let pages = 0;
+    for (;;) {
+      const page = readSpilledToolOutput(dir, spill.path, offset, limit);
+      if (page.text.includes("\uFFFD")) fffd = true;
+      acc += page.text; pages += 1;
+      if (page.eof) break;
+      expect(page.nextOffset).toBeGreaterThan(offset);
+      offset = page.nextOffset;
+    }
+    return { spill, acc, fffd, pages, lastOffset: offset };
+  };
+
+  it("round-trips mixed CJK/emoji byte-exact across pages", () => {
+    const dir = tempDir();
+    try {
+      const text = "a界🌱".repeat(4000);
+      const { spill, acc, fffd } = roundTrip(dir, text, 8000);
+      expect(acc).toBe(text);
+      expect(fffd).toBe(false);
+      expect(spill.size).toBe(32000);
+      const cjk = roundTrip(dir, "界".repeat(5000), 8000);
+      expect(cjk.acc).toBe("界".repeat(5000));
+      expect(cjk.fffd).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("backs off a partial emoji after a complete 2-byte char instead of the unrelated leader", () => {
+    const dir = tempDir();
+    try {
+      const text = "aé" + "🌱" + "b".repeat(100);
+      const spill = spillToolOutput(dir, text, true, null, 10);
+      const first = readSpilledToolOutput(dir, spill.path, 0, 4);
+      expect(first.text).toBe("aé");
+      expect(first.text).not.toContain("\uFFFD");
+      expect(first.nextOffset).toBe(3);
+      const second = readSpilledToolOutput(dir, spill.path, first.nextOffset, 100);
+      expect(second.text.startsWith("🌱")).toBe(true);
+      const full = roundTrip(dir, text, 4);
+      expect(full.acc).toBe(text);
+      expect(full.fffd).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("records original bytes and truncation while capping at 1.5MB", () => {
+    const dir = tempDir();
+    try {
+      const big = "界".repeat(600000);
+      const spill = spillToolOutput(dir, big, true, null, 8000);
+      expect(spill.originalLength).toBe(600000);
+      expect(spill.originalBytes).toBe(1800000);
+      expect(spill.truncated).toBe(true);
+      expect(spill.size).toBe(1500000);
+      expect(spill.size).toBeLessThanOrEqual(1500000);
+      const small = spillToolOutput(dir, "hello 界🌱", true, null, 8000);
+      expect(small.truncated).toBe(false);
+      expect(small.originalBytes).toBe(13);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("never truncates the spill marker path or hash", () => {
+    const dir = tempDir();
+    try {
+      for (const finite of [0, 10, 100, 1000]) {
+        const spill = spillToolOutput(dir, "界🌱".repeat(2000), true, null, finite);
+        expect(spill.preview).toContain(`at ${spill.path}`);
+        expect(spill.preview).toContain(`hash ${spill.hash};`);
+        expect(spill.preview).toContain("read with byte offsets");
+        if (Buffer.byteLength(spill.preview) > finite) {
+          expect(spill.preview.startsWith("\n[full output")).toBe(true);
+        } else {
+          expect(Buffer.byteLength(spill.preview)).toBeLessThanOrEqual(finite);
+        }
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("bounds the hash cache and evicts on prune", () => {
+    const dir = tempDir();
+    try {
+      clearSpillHashCache();
+      for (let i = 0; i < 200; i++) {
+        const spill = spillToolOutput(dir, `value-${i}`, true, null, 10);
+        readSpilledToolOutput(dir, spill.path, 0, 100);
+      }
+      expect(spillHashCacheSize()).toBeLessThanOrEqual(128);
+      const one = spillToolOutput(dir, "only", true, null, 10);
+      readSpilledToolOutput(dir, one.path, 0, 100);
+      const before = spillHashCacheSize();
+      expect(before).toBeGreaterThan(0);
+      const oldDate = new Date(Date.now() - TOOL_RESULT_TTL_MS - 1000);
+      utimesSync(one.path, oldDate, oldDate);
+      pruneSpills(dir);
+      expect(spillHashCacheSize()).toBe(before - 1);
+    } finally { clearSpillHashCache(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("rejects a tampered file even with the same size", () => {
+    const dir = tempDir();
+    try {
+      const spill = spillToolOutput(dir, "ABCDEFGH", true, null, 10);
+      readSpilledToolOutput(dir, spill.path, 0, 100);
+      const stat = statSync(spill.path);
+      writeFileSync(spill.path, "XBCDEFGH");
+      utimesSync(spill.path, stat.atime, stat.mtime);
+      expect(() => readSpilledToolOutput(dir, spill.path, 0, 100)).toThrow(/does not match/);
+      expect(() => readSpilledToolOutput(dir, spill.path, 0, 100, spill.hash)).toThrow(/does not match/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

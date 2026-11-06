@@ -58,6 +58,13 @@ export function botPersona(bot: { name: string; title?: string; description?: st
     .join(" ");
 }
 
+import { createHash } from "node:crypto";
+type PromptResult = { text: string; sections: PromptSection[]; stable: string; volatile: string };
+const PROMPT_CACHE_MAX = 8;
+const promptCache = new Map<string, { stableHash: string; orderHash: string; value: PromptResult }>();
+export function clearSystemPromptCache(): void { promptCache.clear(); }
+function hashParts(parts: PromptPart[]): string { return createHash("sha256").update(JSON.stringify(parts.map((p) => [p.id, p.label, p.text]))).digest("hex").slice(0, 16); }
+/** Stable-before-volatile order so the cached prefix stays byte-identical; holders get copies. */
 export function buildSystemPrompt(
   persona: string,
   soul: string,
@@ -65,21 +72,31 @@ export function buildSystemPrompt(
   agents?: { env?: Record<string, string | undefined> },
   opts?: { replyStyle?: ReplyStyle },
 ): { text: string; sections: PromptSection[]; stable: string; volatile: string } {
+  const bridged = agentsToolBridged(agents);
+  const style = replyStylePrompt(opts?.replyStyle);
+  const soulText = soulSystemPrompt(soul);
+  const key = hashParts([{ id: "persona", label: "Identity", text: persona }, { id: "soul", label: "Standing instructions (SOUL.md)", text: soulText }, { id: "tool-bridge", label: "Tool search", text: bridged ? AGENTS_TOOL_BRIDGE_PROMPT : "" }, { id: "reply-style", label: "Reply style", text: style }, ...parts, { id: "reply-habits", label: "How to reply", text: REPLY_HABITS_PROMPT }]);
+  const stableHash = createHash("sha256").update(JSON.stringify([persona, soulText, bridged, style])).digest("hex").slice(0, 16);
+  const orderHash = hashParts(parts);
+  const hit = promptCache.get(key);
+  if (hit && hit.stableHash === stableHash && hit.orderHash === orderHash) return { ...hit.value, sections: hit.value.sections.map((s) => ({ ...s })) };
   const ordered: PromptPart[] = [
     { id: "persona", label: "Identity", text: persona },
-    { id: "soul", label: "Standing instructions (SOUL.md)", text: soulSystemPrompt(soul) },
-    // Right after the soul: on a direct turn, ahead of every section that names a tool.
-    { id: "tool-bridge", label: "Tool search", text: agentsToolBridged(agents) ? AGENTS_TOOL_BRIDGE_PROMPT : "" },
-    { id: "reply-style", label: "Reply style", text: replyStylePrompt(opts?.replyStyle) },
+    { id: "soul", label: "Standing instructions (SOUL.md)", text: soulText },
+    { id: "tool-bridge", label: "Tool search", text: bridged ? AGENTS_TOOL_BRIDGE_PROMPT : "" },
+    { id: "reply-style", label: "Reply style", text: style },
     ...parts,
     { id: "reply-habits", label: "How to reply", text: REPLY_HABITS_PROMPT },
   ];
   const sections = ordered
     .filter((part) => part.text.length > 0)
     .map((part) => ({ ...part, bytes: Buffer.byteLength(part.text, "utf8") }));
-  const halves = (volatile: boolean) =>
-    sections.filter((section) => VOLATILE_SECTIONS.has(section.id) === volatile).map((section) => section.text).join("");
-  return { text: sections.map((section) => section.text).join(""), sections, stable: halves(false), volatile: halves(true) };
+  const halves = (isVolatile: boolean) =>
+    sections.filter((section) => VOLATILE_SECTIONS.has(section.id) === isVolatile).map((section) => section.text).join("");
+  const value: PromptResult = { text: sections.map((s) => s.text).join(""), sections: sections.map((s) => ({ ...s })), stable: halves(false), volatile: halves(true) };
+  promptCache.set(key, { stableHash, orderHash, value: { ...value, sections: value.sections.map((s) => ({ ...s })) } });
+  while (promptCache.size > PROMPT_CACHE_MAX) { const oldest = promptCache.keys().next().value; if (oldest === undefined) break; promptCache.delete(oldest); }
+  return { ...value, sections: value.sections.map((s) => ({ ...s })) };
 }
 
 // "box" is Boat's persisted kind literal.
