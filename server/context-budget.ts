@@ -35,6 +35,8 @@ export function shouldCompact(input: { contextTokens?: number; estimatedBytes: n
 export const TOOL_OUTPUT_DEFAULT_CHARS = 8_000;
 export const TOOL_OUTPUT_MIN_CHARS = 1_000;
 export const TOOL_OUTPUT_MAX_CHARS = 8_000;
+export const TOOL_OUTPUT_HARD_MAX_BYTES = TOOL_OUTPUT_MAX_CHARS;
+export const HOOK_PREVIEW_HARD_MAX_BYTES = 16_000;
 const TOOL_OUTPUT_BUDGET_SHARE = 0.05;
 
 export type BudgetedHookPreviewInput = {
@@ -43,35 +45,46 @@ export type BudgetedHookPreviewInput = {
   outputReserveTokens?: number | null;
   usedTokens?: number;
 };
+export type ToolOutputBudget = BudgetedHookPreviewInput;
 
-export function budgetedToolOutputChars(
-  budget: { contextWindowTokens?: number | null; reservedOutputTokens?: number | null; outputReserveTokens?: number | null } | null | undefined,
+/**
+ * Bytes end-to-end: 4 bytes/token consistently; return is bytes (== chars for ASCII).
+ * Rename of budgetedToolOutputChars: the return has always been bytes, the old
+ * name is kept as an alias so existing imports keep working.
+ * B2: TOOL_OUTPUT_MAX_CHARS is a hard ceiling - `min(MAX, share)` - it is never
+ * raised with the window. M12: no floor when headroom is exhausted (return 0).
+ * m1: non-positive windows use the default, consistently with 0. m2: usedTokens
+ * carried on the budget object is honoured when no explicit usedTokens is given.
+ */
+export function budgetedToolOutputBytes(
+  budget: ToolOutputBudget | null | undefined,
   usedTokens?: number,
 ): number {
   const window = budget?.contextWindowTokens;
-  if (!window || !Number.isFinite(window)) return TOOL_OUTPUT_DEFAULT_CHARS;
+  if (!positive(window)) return TOOL_OUTPUT_DEFAULT_CHARS;
   const rawReserve = budget?.reservedOutputTokens ?? budget?.outputReserveTokens ?? 0;
   const reserve = Number.isFinite(rawReserve) && rawReserve > 0 ? rawReserve : 0;
-  const used = typeof usedTokens === "number" && Number.isFinite(usedTokens) && usedTokens > 0 ? usedTokens : 0;
-  // Bytes end-to-end: 4 bytes/token consistently; return is bytes (== chars for ASCII).
+  const rawUsed = usedTokens ?? budget?.usedTokens ?? 0;
+  const used = typeof rawUsed === "number" && Number.isFinite(rawUsed) && rawUsed > 0 ? rawUsed : 0;
   const windowBytes = window * 4;
-  const reserveBytes = reserve * 4;
-  const usedBytes = used * 4;
-  const headroomBytes = Math.max(0, windowBytes - reserveBytes - usedBytes);
+  const headroomBytes = Math.max(0, windowBytes - reserve * 4 - used * 4);
+  if (headroomBytes <= 0) return 0;
   const bytes = Math.floor(headroomBytes * TOOL_OUTPUT_BUDGET_SHARE);
   if (!Number.isFinite(bytes)) return TOOL_OUTPUT_DEFAULT_CHARS;
-  // ponytail: cap scales with the window; fixed 8k clipped large windows. Raise cap when share changes.
-  const maxForWindow = Math.max(TOOL_OUTPUT_MAX_CHARS, Math.floor(windowBytes * TOOL_OUTPUT_BUDGET_SHARE));
-  return Math.min(maxForWindow, Math.max(TOOL_OUTPUT_MIN_CHARS, bytes));
+  return Math.min(TOOL_OUTPUT_MAX_CHARS, Math.max(TOOL_OUTPUT_MIN_CHARS, bytes));
 }
+export const budgetedToolOutputChars = budgetedToolOutputBytes;
 
-export function budgetedHookPreviewChars(
-  budget: { contextWindowTokens?: number | null; reservedOutputTokens?: number | null; outputReserveTokens?: number | null } | null | undefined,
+export function budgetedHookPreviewBytes(
+  budget: ToolOutputBudget | null | undefined,
   usedTokens?: number,
 ): number {
-  const window = budget?.contextWindowTokens;
-  const windowBytes = typeof window === "number" && Number.isFinite(window) ? window * 4 : 0;
-  const maxForWindow = Math.max(16_000, Math.floor(windowBytes * TOOL_OUTPUT_BUDGET_SHARE) * 2);
-  return Math.min(maxForWindow, Math.max(2_000, budgetedToolOutputChars(budget, usedTokens) * 2));
+  const base = budgetedToolOutputBytes(budget, usedTokens);
+  if (base <= 0) return 0;
+  return Math.min(HOOK_PREVIEW_HARD_MAX_BYTES, Math.max(2_000, base * 2));
 }
-// ponytail: MAX is fixed at 128_000 chars (~512kB budget). If smaller windows matter, scale MAX from window; keep literals for now. 8000/16000 previews unchanged.
+export const budgetedHookPreviewChars = budgetedHookPreviewBytes;
+// m3: TOOL_OUTPUT_DEFAULT_CHARS (8k) is what is returned when no positive window
+// is supplied; TOOL_OUTPUT_MAX_CHARS (8k) is the hard ceiling for a budgeted
+// tool-output preview regardless of window size. There is no 128k-char max here
+// (128k is the default context window in tokens, a different quantity).

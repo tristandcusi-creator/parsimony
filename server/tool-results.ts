@@ -1,6 +1,6 @@
 // Short-lived overflow for agents tool results: authorize the live turn first; ownership is both bot and conversation.
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, fstatSync, mkdirSync, openSync, readSync, readdirSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, join, resolve, sep } from "node:path";
 import { redactSecretsInText } from "../shared/redact.ts";
 
@@ -31,6 +31,8 @@ function byteBoundaryEnd(buf: Buffer, max: number): number {
   return lead + needed <= limit ? limit : lead;
 }
 export function truncateBytes(text: string, maxBytes: number): string {
+  // m4: +Infinity means unbounded, not empty. NaN/-Infinity/negative mean 0.
+  if (maxBytes === Infinity) return text;
   const max = Number.isFinite(maxBytes) && maxBytes >= 0 ? Math.floor(maxBytes) : 0;
   if (max === 0) return "";
   const buf = Buffer.from(text, "utf8");
@@ -40,7 +42,12 @@ export function truncateBytes(text: string, maxBytes: number): string {
 }
 
 const MAX_SPILL_BYTES = 1_500_000;
-const TOOL_RESULT_MAX_BYTES = MAX_SPILL_BYTES;
+// B3: per-file cap and total directory quota are different quantities. The old
+// code used the 1.5MB per-file cap as the whole-directory cap, so two ~1MB
+// spills pruned the first one and broke its marker. Total quota is the legacy
+// 16MB MAX_BYTES; eviction is oldest-first and best-effort (TTL 1h, then quota).
+const SPILL_DIR_MAX_BYTES = MAX_BYTES;
+const TOOL_RESULT_MAX_BYTES = SPILL_DIR_MAX_BYTES;
 const sha256Hex = (text: string): string => createHash("sha256").update(text).digest("hex");
 
 export interface SpilledToolOutput {
@@ -51,7 +58,8 @@ export interface SpilledToolOutput {
   originalLength: number;
   originalBytes: number;
   truncated: boolean;
-  ok: boolean;
+  // M2: null means the outcome is unknown - never fabricate true/false.
+  ok: boolean | null;
   error: string | null;
   exitCode: number | null;
 }
@@ -62,31 +70,47 @@ export interface SpillPage {
   size: number;
   eof: boolean;
 }
-const spillHashCache = new Map<string, { value: string; at: number }>();
+// M8: the cache is now actually read, but only when the file's identity
+// (size, mtime, ctime, inode) is unchanged since the last full verification.
+// ctime cannot be reset by utimes(), so an in-place same-size tamper that
+// restores mtime still invalidates the entry and is re-hashed below.
+type HashCacheEntry = { value: string; at: number; size: number; mtimeMs: number; ctimeMs: number; ino: number };
+const spillHashCache = new Map<string, HashCacheEntry>();
 export function clearSpillHashCache(): void { spillHashCache.clear(); }
 export function spillHashCacheSize(): number { return spillHashCache.size; }
-function setHashCache(path: string, value: string): void {
+function statKey(st: { size: number; mtimeMs: number; ctimeMs: number; ino: number }): Pick<HashCacheEntry, "size" | "mtimeMs" | "ctimeMs" | "ino"> {
+  return { size: st.size, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs, ino: st.ino };
+}
+function setHashCache(path: string, value: string, st?: { size: number; mtimeMs: number; ctimeMs: number; ino: number }): void {
   spillHashCache.delete(path);
-  spillHashCache.set(path, { value, at: Date.now() });
+  spillHashCache.set(path, { value, at: Date.now(), ...(st ? statKey(st) : { size: -1, mtimeMs: -1, ctimeMs: -1, ino: -1 }) });
   while (spillHashCache.size > 128) {
     const oldest = spillHashCache.keys().next().value;
     if (oldest === undefined) break;
     spillHashCache.delete(oldest);
   }
 }
+function cachedHash(path: string, st: { size: number; mtimeMs: number; ctimeMs: number; ino: number }): string | undefined {
+  const entry = spillHashCache.get(path);
+  if (!entry || entry.size < 0) return undefined;
+  const key = statKey(st);
+  return entry.size === key.size && entry.mtimeMs === key.mtimeMs && entry.ctimeMs === key.ctimeMs && entry.ino === key.ino ? entry.value : undefined;
+}
 
-let lastPruneAt = 0;
+const lastPruneAtByDir = new Map<string, number>();
 const PRUNE_THROTTLE_MS = 60_000;
 export function spillPathRegex(): RegExp {
   return /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.txt$/;
 }
-export function pruneSpills(dir: string): void {
+export function pruneSpills(dir: string, keep?: Iterable<string>): void {
   const now = Date.now();
+  const keepSet = keep ? new Set([...keep].map((name) => basename(name))) : undefined;
   let entries: string[];
   try { entries = readdirSync(dir); } catch { return; }
   const withDates: Array<{ name: string; mtimeMs: number; size: number }> = [];
   for (const name of entries) {
     if (!spillPathRegex().test(name)) continue;
+    if (keepSet?.has(name)) continue;
     try {
       const st = statSync(join(dir, name));
       if (!st.isFile()) continue;
@@ -101,6 +125,8 @@ export function pruneSpills(dir: string): void {
   withDates.sort((a, b) => a.mtimeMs - b.mtimeMs);
   let bytes = 0;
   for (const entry of withDates) bytes += entry.size;
+  // B3: total-directory quota (16MB), not the 1.5MB per-file cap. Eviction is
+  // oldest-first and best-effort; callers with live refs can pass `keep`.
   for (const entry of withDates) {
     if (bytes <= TOOL_RESULT_MAX_BYTES) break;
     try {
@@ -110,15 +136,21 @@ export function pruneSpills(dir: string): void {
     } catch { continue; }
   }
 }
-function maybePrune(dir: string): void {
+function maybePrune(dir: string, keep?: Iterable<string>): void {
+  // m6: throttle is per-directory, and recorded only after pruning runs.
+  const key = resolve(dir);
   const now = Date.now();
-  if (now - lastPruneAt < PRUNE_THROTTLE_MS) return;
-  lastPruneAt = now;
-  pruneSpills(dir);
+  if (now - (lastPruneAtByDir.get(key) ?? 0) < PRUNE_THROTTLE_MS) return;
+  pruneSpills(dir, keep);
+  lastPruneAtByDir.set(key, Date.now());
 }
-export function spillToolOutput(dir: string, output: string, ok: boolean, error: string | null, previewBytes: number, exitCode?: number): SpilledToolOutput {
+export function spillToolOutput(dir: string, output: string, ok: boolean | null, error: string | null, previewBytes: number, exitCode?: number | null): SpilledToolOutput {
+  // M11: empty dir used to skip the write yet return a marker claiming a file.
+  if (!dir) throw new Error("spill dir required");
   const finite = Number.isFinite(previewBytes) && previewBytes >= 0 ? Math.floor(previewBytes) : 0;
   const redacted = redactSecretsInText(output);
+  // M11: redact error too - it is embedded in the marker and returned.
+  const safeError = error ? redactSecretsInText(error) : null;
   const originalBytes = Buffer.byteLength(redacted, "utf8");
   const originalLength = redacted.length;
   // ponytail: unbounded write capped to 1.5MB via byte-boundary truncator so write <= read.
@@ -127,28 +159,53 @@ export function spillToolOutput(dir: string, output: string, ok: boolean, error:
   const hash = sha256Hex(storedText);
   const rel = `${hash}.txt`;
   const path = join(dir, rel);
-  const size = originalBytes;
-  const truncated = stored !== size;
-  if (dir) {
-    try {
-      mkdirSync(dir, { recursive: true, mode: 0o700 });
-    } catch (e) {
-      throw new Error(`spill dir not writable: ${String(e)}`);
-    }
-    try {
-      writeFileSync(path, storedText, { flag: "w", mode: 0o600 });
-    } catch (e) {
-      throw new Error(`spill write failed: ${String(e)}`);
-    }
-    // ponytail: hash is verified on first read; cache alone is not trusted after tamper (re-hash if mtime/size changed). ceil: O(1) mtime check.
-    setHashCache(path, hash);
-    maybePrune(dir);
+  const truncated = stored !== originalBytes;
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+  } catch (e) {
+    throw new Error(`spill dir not writable: ${String(e)}`);
   }
-  const marker = `\n[full output ${originalLength} chars (${originalBytes} bytes); at ${path}; hash ${hash}; stored ${stored} chars (${stored} bytes${truncated ? "; truncated to 1.5MB cap" : ""}); ok=${ok}; error=${JSON.stringify(error)}; exitCode=${exitCode ?? "null"}; read with byte offsets 0..${stored}]`;
+  // M1: never follow a pre-planted symlink at the destination, and publish
+  // atomically: write a unique temp file inside the dir, then rename over the
+  // destination. A symlink destination is unlinked (rename would replace the
+  // link itself, but unlink first keeps Windows behaviour explicit); the
+  // renamed file is a fresh regular file, readers see whole old or new bytes.
+  let realDir: string;
+  try {
+    realDir = realpathSync(dir);
+    if (!statSync(realDir).isDirectory()) throw new Error("spill dir is not a directory");
+  } catch (e) {
+    throw new Error(`spill dir not writable: ${String(e)}`);
+  }
+  const tmpPath = join(realDir, `.tmp-${hash.slice(0, 16)}-${randomUUID()}.tmp`);
+  try {
+    writeFileSync(tmpPath, storedText, { flag: "wx", mode: 0o600 });
+    try {
+      const dest = lstatSync(path);
+      if (dest.isSymbolicLink() || !dest.isFile()) unlinkSync(path);
+    } catch { /* destination does not exist yet */ }
+    renameSync(tmpPath, path);
+  } catch (e) {
+    try { unlinkSync(tmpPath); } catch { /* already renamed/removed */ }
+    throw new Error(`spill write failed: ${String(e)}`);
+  }
+  try { setHashCache(path, hash, statSync(path)); } catch { setHashCache(path, hash); }
+  maybePrune(dir, [rel]);
+  // M5: `stored` is bytes; the char count is storedText.length (UTF-16 units).
+  const okLabel = ok === null ? "unknown" : String(ok);
+  const marker = `\n[full output ${originalLength} chars (${originalBytes} bytes); at ${path}; hash ${hash}; stored ${storedText.length} chars (${stored} bytes${truncated ? "; truncated to 1.5MB cap" : ""}); ok=${okLabel}; error=${JSON.stringify(safeError)}; exitCode=${exitCode ?? "null"}; read with byte offsets 0..${stored}]`;
   const markerBytes = Buffer.byteLength(marker, "utf8");
-  const headBudget = Math.max(0, finite - markerBytes);
-  const preview = markerBytes > finite ? marker : truncateBytes(redacted, headBudget) + marker;
-  return { preview, path, hash, size: stored, originalLength, originalBytes, truncated, ok, error, exitCode: exitCode ?? null };
+  // M6: head comes from the stored (capped) text, never from uncapped input,
+  // and the preview never exceeds its budget - a marker larger than the
+  // budget is itself truncated to the budget (callers that need the full
+  // marker must pass a budget at least the marker size).
+  if (finite <= 0) return { preview: "", path, hash, size: stored, originalLength, originalBytes, truncated, ok, error: safeError, exitCode: exitCode ?? null };
+  if (markerBytes > finite) {
+    return { preview: truncateBytes(marker, finite), path, hash, size: stored, originalLength, originalBytes, truncated, ok, error: safeError, exitCode: exitCode ?? null };
+  }
+  const headBudget = finite - markerBytes;
+  const preview = truncateBytes(storedText, headBudget) + marker;
+  return { preview, path, hash, size: stored, originalLength, originalBytes, truncated, ok, error: safeError, exitCode: exitCode ?? null };
 }
 
 function assertInside(dir: string, rel: string): string {
@@ -163,8 +220,12 @@ function assertInside(dir: string, rel: string): string {
   try {
     realRoot = realpathSync(dir);
     realPath = realpathSync(resolved);
-  } catch {
-    return resolved;
+  } catch (e) {
+    // M10: never fail open. Only a missing file is the expected ENOENT case;
+    // anything else (loops, permissions, not-a-directory) is invalid.
+    const code = (e as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "ENOENT") throw new Error("spill file not found");
+    throw new Error("invalid spill reference");
   }
   if (realPath !== realRoot && !realPath.startsWith(`${realRoot}${sep}`)) throw new Error("spill reference escapes spill dir");
   return resolved;
@@ -177,26 +238,38 @@ export function readSpilledToolOutput(dir: string, rel: string, offset: number, 
   if (!Number.isFinite(maxBytes) || maxBytes <= 0 || maxBytes > 1_500_000) throw new Error("maxBytes out of range");
   let fd: number;
   try {
-    fd = openSync(path, "r");
+    // O_NOFOLLOW: refuse a symlink that raced in after assertInside.
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   } catch {
     throw new Error("spill file not found");
   }
   try {
-    const size = fstatSync(fd).size;
+    const st = fstatSync(fd);
+    const size = st.size;
+    if (!st.isFile()) throw new Error("spill file not found");
     if (size > 1_500_000) throw new Error("spill file too large");
     const expected = typeof hash === "string" && hash ? hash : basename(path, ".txt");
-    // ponytail: never trust cache alone; re-hash always (ceil: mtime check). cache only avoids repeat in same process.
-    const hasher = createHash("sha256");
-    const chunk = Buffer.alloc(64 * 1024);
-    for (let pos = 0; pos < size;) {
-      const n = readSync(fd, chunk, 0, Math.min(chunk.length, size - pos), pos);
-      if (n <= 0) break;
-      hasher.update(chunk.subarray(0, n));
-      pos += n;
+    // M8: skip the re-hash only on a stat-validated cache hit (see above);
+    // otherwise re-hash the whole file and fail closed on mismatch.
+    const cached = cachedHash(path, st);
+    let computed: string;
+    if (cached !== undefined) {
+      computed = cached;
+    } else {
+      const hasher = createHash("sha256");
+      const chunk = Buffer.alloc(64 * 1024);
+      for (let pos = 0; pos < size;) {
+        const n = readSync(fd, chunk, 0, Math.min(chunk.length, size - pos), pos);
+        // m10: a short read here means the file changed under us - say so,
+        // instead of digesting a prefix and blaming tampering.
+        if (n <= 0) throw new Error("spill file changed during read");
+        hasher.update(chunk.subarray(0, n));
+        pos += n;
+      }
+      computed = hasher.digest("hex");
     }
-    const computed = hasher.digest("hex");
     if (computed !== expected) throw new Error(`ref "${rel}" does not match stored hash; evidence may be tampered`);
-    setHashCache(path, computed);
+    setHashCache(path, computed, st);
     const clamped = Math.min(off, size);
     if (clamped >= size) return { text: "", offset: clamped, nextOffset: size, size, eof: true };
     if (limit === 0) return { text: "", offset: clamped, nextOffset: clamped, size, eof: false };
@@ -214,7 +287,12 @@ export function readSpilledToolOutput(dir: string, rel: string, offset: number, 
     if (end <= 0) {
       if (filled <= 0) throw new Error("spill file changed during read");
       const needed = codePointLen(slice[0]!);
+      // M13: `limit` is the real cap (maxBytes is only a sanity ceiling).
+      // Reading one codepoint past `limit` would silently exceed it, so a
+      // limit smaller than one codepoint is an explicit error, not a page
+      // that is both over-limit and (if we returned "") non-progressing.
       if (needed > maxBytes) throw new Error("maxBytes too small for one codepoint");
+      if (needed > limit) throw new Error("limit too small for one codepoint");
       if (clamped + needed > size) throw new Error("spill file ends mid-codepoint");
       const extra = Buffer.alloc(needed);
       let got = 0;

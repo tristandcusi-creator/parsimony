@@ -143,20 +143,27 @@ describe("spilled tool output", () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it("never truncates the spill marker path or hash", () => {
+  it("bounds the spill marker to the preview budget", () => {
     const dir = tempDir();
     try {
-      for (const finite of [0, 10, 100, 1000]) {
-        const spill = spillToolOutput(dir, "界🌱".repeat(2000), true, null, finite);
-        expect(spill.preview).toContain(`at ${spill.path}`);
-        expect(spill.preview).toContain(`hash ${spill.hash};`);
-        expect(spill.preview).toContain("read with byte offsets");
-        if (Buffer.byteLength(spill.preview) > finite) {
-          expect(spill.preview.startsWith("\n[full output")).toBe(true);
-        } else {
-          expect(Buffer.byteLength(spill.preview)).toBeLessThanOrEqual(finite);
-        }
+      const text = "界🌱".repeat(2000);
+      const zero = spillToolOutput(dir, text, true, null, 0);
+      expect(zero.preview).toBe("");
+      expect(zero.path).toContain(".txt");
+      expect(zero.hash).toHaveLength(64);
+      expect(zero.size).toBeGreaterThan(0);
+      expect(readSpilledToolOutput(dir, zero.path, 0, 100).text.length).toBeGreaterThan(0);
+      for (const finite of [10, 100]) {
+        const spill = spillToolOutput(dir, text, true, null, finite);
+        expect(Buffer.byteLength(spill.preview, "utf8")).toBeLessThanOrEqual(finite);
+        expect(spill.preview.startsWith("\n[full out")).toBe(true);
+        expect(readSpilledToolOutput(dir, spill.path, 0, 100).text.length).toBeGreaterThan(0);
       }
+      const full = spillToolOutput(dir, text, true, null, 1000);
+      expect(Buffer.byteLength(full.preview, "utf8")).toBeLessThanOrEqual(1000);
+      expect(full.preview).toContain(`at ${full.path}`);
+      expect(full.preview).toContain(`hash ${full.hash};`);
+      expect(full.preview).toContain("read with byte offsets");
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
