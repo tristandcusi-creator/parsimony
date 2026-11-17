@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { ChevronDown, Search, X } from "lucide-react";
 
-import { useStore, type Bot } from "@/state/store";
+import { useStore, type Bot, type BotSettingsSection } from "@/state/store";
 import { cn } from "@/lib/cn";
 import { useCaptionChrome } from "./DesktopCapabilities";
-import { BOT_SECTIONS } from "./bot-settings/sections";
+import { BOT_SECTIONS, appSearchPhase, searchEmptyText, sectionLabel, sectionMatches } from "./bot-settings/sections";
+import { useBotApps } from "./bot-settings/useBotApps";
 import { useBotSettingsDerived } from "./bot-settings/useBotSettingsDerived";
 import { OverviewSection } from "./bot-settings/OverviewSection";
 import { IdentitySection } from "./bot-settings/IdentitySection";
@@ -24,17 +25,15 @@ import { VisibilitySection } from "./bot-settings/VisibilitySection";
 import { t } from "@/lib/i18n";
 import { useAdvancedMode } from "@/lib/interface-mode";
 import { BotPanel } from "./bot-panel/PanelShell";
+import { LibraryTab } from "./bot-panel/LibraryTab";
+import type { SimplePageId } from "./bot-panel/page-registry";
 import { BOT_PANEL_ID, sidePanelCls } from "./bot-panel/side-panel";
 import { HistoryRollbackDialog, useBotHistory, useBotOverview } from "./bot-settings/useBotOverview";
 import { useOwnerOrAdmin } from "@/lib/use-owner-or-admin";
 import { ShareBotButton, useTeamName } from "./bot-access/ShareBotButton";
 
-const sectionLabel = (entry: (typeof BOT_SECTIONS)[number]) => (entry.labelKey ? t(entry.labelKey) : entry.label);
-
-function sectionMatches(entry: (typeof BOT_SECTIONS)[number], query: string): boolean {
-  if (!query) return true;
-  return [entry.label, sectionLabel(entry), ...entry.keywords].some((part) => part.toLowerCase().includes(query));
-}
+/** Where the Library's memory, skills and folder rows lead in Advanced settings. */
+const LIBRARY_LINKS: Partial<Record<SimplePageId, BotSettingsSection>> = { memory: "memory", skills: "skills", folder: "access" };
 
 export function BotSettingsDialog({ bot, overlay = false }: {
   bot: Bot;
@@ -57,7 +56,10 @@ export function BotSettingsDialog({ bot, overlay = false }: {
   const sections = BOT_SECTIONS
     .filter((entry) => entry.id !== "slack" || slackUrl !== null)
     .filter((entry) => entry.id !== "visibility" || (!window.ogb && ownerOrAdmin === true && !teamName));
-  const visibleSections = sections.filter((entry) => sectionMatches(entry, q));
+  // Connected apps load only once the person searches; their names find the Access section.
+  const searchApps = useBotApps(bot, q !== "");
+  const appNames = searchApps.apps.flatMap((app) => [app.label, app.slug]);
+  const visibleSections = sections.filter((entry) => sectionMatches(entry, q, appNames));
 
   const { overview, overviewError, prompt, promptError } = useBotOverview(bot, {
     overview: section === "overview" && !simpleView,
@@ -100,7 +102,7 @@ export function BotSettingsDialog({ bot, overlay = false }: {
     switch (id) {
       case "overview":
         return overview === null && overviewError ? (
-          <div className="rounded-xl bg-card p-4 text-[13px] text-ink-secondary">Couldn’t load the overview.</div>
+          <div className="rounded-xl bg-card p-4 text-[13px] text-ink-secondary">{t("botSettings.overviewFailed")}</div>
         ) : (
           <OverviewSection
             overview={overview}
@@ -131,6 +133,8 @@ export function BotSettingsDialog({ bot, overlay = false }: {
         return <SkillsSection bot={bot} />;
       case "memory":
         return <MemorySection bot={bot} active={!collapsed && section === "memory"} onToggle={(enabled) => derived.patch({ memoryEnabled: enabled })} />;
+      case "library":
+        return <LibraryTab bot={bot} onOpen={(page) => dispatch({ type: "toggleSettings", open: true, section: LIBRARY_LINKS[page] ?? "overview" })} />;
       case "routines":
         return <RoutinesSection bot={bot} routines={derived.botRoutines} runs={state.routineRuns} />;
       case "access":
@@ -145,7 +149,7 @@ export function BotSettingsDialog({ bot, overlay = false }: {
         return <VisibilitySection bot={bot} />;
       case "history":
         return history.rows === null && history.error ? (
-          <div className="rounded-xl bg-card p-4 text-[13px] text-ink-secondary">Couldn’t load history.</div>
+          <div className="rounded-xl bg-card p-4 text-[13px] text-ink-secondary">{t("botSettings.historyFailed")}</div>
         ) : (
           <HistorySection
             bot={bot}
@@ -189,7 +193,7 @@ export function BotSettingsDialog({ bot, overlay = false }: {
             <button
               type="button"
               onClick={() => dispatch({ type: "toggleSettings", open: false })}
-              aria-label="Close settings"
+              aria-label={t("botSettings.simple.close")}
               className="rounded-md p-1 text-ink-secondary hover:bg-control hover:text-ink"
             >
               <X size={18} className="pointer-events-none" />
@@ -220,13 +224,13 @@ export function BotSettingsDialog({ bot, overlay = false }: {
         <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
           {visibleSections.length === 0 && (
             <div className="px-4 py-4 text-[13px] leading-relaxed text-ink-secondary">
-              {t("botSettings.searchNone", { query: query.trim() })}
+              {searchEmptyText(query.trim(), appSearchPhase(searchApps))}
             </div>
           )}
           {sections.map((entry) => {
             const { id, icon: Icon } = entry;
             const label = sectionLabel(entry);
-            const matched = sectionMatches(entry, q);
+            const matched = sectionMatches(entry, q, appNames);
             if (!matched && id !== "memory") return null;
             const open = !collapsed && section === id;
             return (

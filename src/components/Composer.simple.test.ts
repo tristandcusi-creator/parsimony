@@ -14,6 +14,8 @@ import { BOT_BUTTON, botButtonTone } from "@/lib/bot-button";
 
 const fixture = vi.hoisted(() => ({
   advanced: false,
+  admin: true,
+  agentsMcp: true,
   dispatch: vi.fn(),
   call: null as Record<string, unknown> | null,
   groupCall: null as Record<string, unknown> | null,
@@ -25,14 +27,14 @@ vi.mock("@/state/store", async (importOriginal) => {
   const original = await importOriginal<typeof import("@/state/store")>();
   return { ...original, useStore: () => ({
     state: { ...original.initialState, config: fixture.config ?? original.initialState.config, bots: [bot, peer], liveCall: fixture.liveCall, instances: [{
-      instanceId: ENGINE, driverKind: "claudeAgent", displayName: "Claude", capabilities: { agentsMcp: true },
+      instanceId: ENGINE, driverKind: "claudeAgent", displayName: "Claude", capabilities: { agentsMcp: fixture.agentsMcp },
     }] },
     dispatch: fixture.dispatch,
   }) };
 });
 vi.mock("@/lib/analytics", () => ({ track: vi.fn() }));
 vi.mock("@/lib/cloud-guest", async (importOriginal) => ({ ...await importOriginal<typeof import("@/lib/cloud-guest")>(), useReactor: () => "user" }));
-vi.mock("@/lib/use-owner-or-admin", () => ({ useOwnerOrAdmin: () => true }));
+vi.mock("@/lib/use-owner-or-admin", () => ({ useOwnerOrAdmin: () => fixture.admin }));
 vi.mock("@/lib/interface-mode", () => ({ useAdvancedMode: () => fixture.advanced, setAdvancedMode: vi.fn() }));
 vi.mock("./CallView", () => ({ CallButton: (props: Record<string, unknown>) => {
   fixture.call = props;
@@ -86,6 +88,8 @@ function openPlus() {
 
 beforeEach(() => {
   fixture.advanced = false;
+  fixture.admin = true;
+  fixture.agentsMcp = true;
   fixture.liveCall = null;
   fixture.config = undefined;
   setCallMode("turns");
@@ -128,7 +132,7 @@ describe("the Simple composer in a bot chat", () => {
     expect([...menu()!.querySelectorAll("[data-menu-key]")].map((row) => row.textContent)).toEqual(["Attach files", "Work until done", "Teach a task"]);
     const row = menu()!.querySelector("[data-menu-key='attach']")!.className.split(" ");
     expect(row).toEqual(expect.arrayContaining(["h-[34px]", "gap-2", "px-3", "text-[15px]"]));
-    expect(menu()!.className.split(" ")).toEqual(expect.arrayContaining(["popover-surface", "rounded-[14px]", "w-max", "min-w-[200px]", "max-w-[280px]"]));
+    expect(menu()!.className.split(" ")).toEqual(expect.arrayContaining(["popover-surface", "rounded-[12px]", "w-max", "min-w-[200px]", "max-w-[280px]"]));
   });
 
   it("starts a /learn draft from Teach a task, ahead of anything already typed", () => {
@@ -194,20 +198,22 @@ describe("the Simple composer in a bot chat", () => {
     expectBotButton(sendButton(), "yellow");
   });
 
-  it("turns its round button into Stop while the bot works, and keeps a quiet Stop beside Send while you type", () => {
+  it("keeps Call beside Stop while the bot works, including while typing", () => {
     const busy = { ...bot, busy: true };
     render({ bot: busy });
     const slot = container.querySelector<HTMLButtonElement>('[data-composer-stop="slot"]')!;
     expect(slot.getAttribute("aria-label")).toBe("Stop this turn");
     expectBotButton(slot, "purple");
-    expect(fixture.call).toBeNull();
+    expect(fixture.call).toMatchObject({ bot: { id: "atlas" }, placement: "composer" });
     click(slot);
     expect(fixture.dispatch).toHaveBeenCalledWith({ type: "interrupt", botId: "atlas", threadId: "atlas-thread" });
 
     restoreComposerDraft(`bot:${bot.id}:${bot.threadId}`, { text: "and also this", attachments: [] });
+    fixture.call = null;
     render({ bot: busy });
     expect(container.querySelector('[data-composer-stop="beside"]')).not.toBeNull();
     expect(container.querySelector('[data-composer-stop="slot"]')).toBeNull();
+    expect(fixture.call).toMatchObject({ bot: { id: "atlas" }, placement: "composer" });
   });
 
   it("shows the approval level as a chip only while this conversation overrides the bot, in the panel's words", () => {
@@ -296,6 +302,30 @@ describe("the Advanced composer", () => {
     expect(fixture.call).toMatchObject({ placement: "composer" });
     expect(fixture.call?.fill).toBeUndefined();
     expect(container.querySelector("[data-composer-backdrop]")!.className.split(" ")).toContain("top-1/2");
+  });
+
+  it("offers Teach a task as its own button, which starts a /learn draft ahead of anything typed", () => {
+    fixture.advanced = true;
+    restoreComposerDraft(`bot:${bot.id}:${bot.threadId}`, { text: "how I file expenses", attachments: [] });
+    render({ bot });
+    const teach = container.querySelector<HTMLButtonElement>('button[aria-label="Teach a task"]');
+    expect(teach).not.toBeNull();
+    click(teach);
+    expect(container.querySelector("textarea")!.value).toBe("/learn how I file expenses");
+  });
+
+  it("leaves Teach a task out when skill authoring is off", () => {
+    fixture.advanced = true;
+    fixture.config = { features: { skillAuthoring: false } };
+    render({ bot });
+    expect(container.querySelector('button[aria-label="Teach a task"]')).toBeNull();
+  });
+
+  it("leaves Teach a task out when the bot's engine can't run agents", () => {
+    fixture.advanced = true;
+    fixture.agentsMcp = false;
+    render({ bot });
+    expect(container.querySelector('button[aria-label="Teach a task"]')).toBeNull();
   });
 
   it("sends with the bot's own button too, and keeps the accent in a room", () => {
@@ -389,4 +419,14 @@ describe("the Advanced composer", () => {
       expect(classes("[data-composer-row]")).not.toContain("flex-wrap");
     });
   });
+});
+
+it.each([false, true])("keeps Call for a shared viewer without Stop permission (waiting for teammates: %s)", waiting => {
+  fixture.admin = false;
+  fixture.config = { team: true };
+  const shared: Bot = { ...bot, tasks: [{ threadId: bot.threadId, title: "Shared", createdAt: 1, busy: !waiting, waitingForTeammates: waiting, askedBy: { id: "other-person", name: "Other person" } }] };
+  restoreComposerDraft(`bot:${bot.id}:${bot.threadId}`, { text: "Follow-up from another viewer", attachments: [] });
+  render({ bot: shared });
+  expect(container.querySelector('[aria-label="Stop this turn"]')).toBeNull();
+  expect(fixture.call).toMatchObject({ bot: { id: "atlas" }, placement: "composer" });
 });

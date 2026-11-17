@@ -6,6 +6,7 @@ import type { EffortLevel } from "../shared/wire.ts";
 import type {
   DriverKind, InstanceId, ModelVariantOption, RuntimeEventListener, ThreadId, TurnId,
 } from "../shared/runtime-events.ts";
+import type { LocalModelFacts, OllamaProblem } from "../shared/local-model.ts";
 import type { ProviderIcon } from "../shared/provider-icon.ts";
 
 export type { CloudBackend, EffortLevel, ModelSelection } from "../shared/wire.ts";
@@ -87,6 +88,15 @@ export interface TurnImageInput {
   path: string;
   mime: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
   bytes: number;
+  /** Set on a frame sampled from an attached video, so a content-type router can tell it apart from a person's own picture. */
+  source?: "video-frame";
+}
+
+/** A video already admitted to the private attachment store; resolved into TurnImageInput frames before any driver sees it. */
+export interface TurnVideoInput {
+  path: string;
+  mime: "video/mp4" | "video/webm" | "video/quicktime";
+  bytes: number;
 }
 
 // `driver` is any slug: an unknown driver round-trips as an unavailable shadow snapshot.
@@ -98,6 +108,8 @@ export interface InstanceConfig {
   icon?: ProviderIcon;
   environment?: Record<string, string>;
   enabled?: boolean;
+  /** Left out of every model list, picker and automatic choice; the engine itself (its CLI and sign-in) is untouched. */
+  hidden?: boolean;
   /** Picker group over the driver's default: an `openai-compat` instance on a provider's own key is "api". */
   access?: EngineAccess;
   config?: unknown;
@@ -151,6 +163,9 @@ export interface SendTurnInput {
    * carry the volatile half in the newest user message so the cached prefix stays byte-identical. */
   systemStable?: string;
   systemVolatile?: string;
+  /** The team roster as it appears in systemStable. It changes whenever a bot is added, renamed or removed, so a per-thread
+   * process keys on systemStable without it and a warm one gets a changed roster as a note (prompt-split.ts). */
+  systemRoster?: string;
   /** The message tags teammates, so digest-based delivery must not suppress the mentions note even when it is unchanged. */
   mentionTurn?: boolean;
   /** The bot will likely browse, so a driver may load browser tools up front rather than behind tool search. */
@@ -180,8 +195,8 @@ export interface SendTurnInput {
     browser?: { command: string; args: string[]; env: Record<string, string> };
     /** The Data tools' MCP proxy: DuckDB on this bot's own database. */
     data?: { command: string; args: string[]; env: Record<string, string> };
-    /** The HighLevel CRM tools' MCP proxy: the harness holds the tokens and the per-bot verdict. */
-    highlevel?: { command: string; args: string[]; env: Record<string, string> };
+    /** The Email tools' MCP proxy: the harness holds the passwords and the per-bot verdict. */
+    email?: { command: string; args: string[]; env: Record<string, string> };
     /** The paired phone's app tools' MCP proxy: the harness holds the jobs and the per-bot verdict. */
     device?: { command: string; args: string[]; env: Record<string, string> };
     /** dweb daemon tools; `url` is the dweb HTTP base. */
@@ -195,10 +210,14 @@ export interface SendTurnInput {
     customResultBudgets?: Record<string, number>;
   };
   cwd?: string;
+  /** Engines with no working folder (the chat drivers): where an MCP result too big for the model is saved whole; a folder attach_file can deliver from. */
+  toolResultFolder?: string;
   /** Also load the person's own CLI MCP setup (Claude Code user scope, claude.ai connectors). */
   mcpFromUserConfig?: boolean;
   /** Claude Code loads the person's own `~/.claude/skills` from this folder's `.claude/skills` (`--add-dir`). */
   userSkillsDir?: string;
+  /** Harness-selected SKILL.md files available to this turn; a driver may stage their folders for native file access. */
+  skillFiles?: readonly string[];
   /** The bot's own Claude Code settings: `.claude/settings.json` in its working folder, else in its own folder. A Claude
    * turn in any other folder takes their hooks, plugins, permission rules and env. */
   botSettingsFile?: string;
@@ -247,8 +266,8 @@ export interface ProviderAdapter {
     browserMcp?: boolean;
     /** The driver can mount the Data tools MCP. */
     dataMcp?: boolean;
-    /** The driver can mount the HighLevel CRM tools MCP. */
-    highlevelMcp?: boolean;
+    /** The driver can mount the Email tools MCP. */
+    emailMcp?: boolean;
     /** The driver can mount the phone apps MCP. */
     deviceMcp?: boolean;
     /** The engine accepts images in the prompt (gates composer paste). */
@@ -340,6 +359,8 @@ export interface ProviderSnapshot {
   state: "available" | "unavailable";
   reason?: string;
   authenticated?: boolean;
+  /** The CLI path runs another program: it answered --version as something other than this engine's own CLI. */
+  notEngineCli?: true;
   /** Display identity from the provider CLI, never credentials; `method` is a personal login or the workspace API key. */
   account?: { email?: string; organization?: string; method?: "login" | "api-key" };
   version?: string | null;
@@ -347,7 +368,10 @@ export interface ProviderSnapshot {
   update?: {
     title: string;
     message: string;
-    command: string;
+    /** Absent when there is nothing to run here, e.g. My Cloud's engines update with the Cloud. */
+    command?: string;
+    /** False when the app installer cannot supply this version; offer the terminal command instead. */
+    serverInstall?: false;
   };
   /** On a subscription a reported cost is notional. */
   billing?: "metered" | "subscription";
@@ -356,6 +380,8 @@ export interface ProviderSnapshot {
     title: string;
     message: string;
   };
+  /** Set with `unavailable` on a server recognised as Ollama: what stops it, for the app to say in its own words. */
+  ollama?: OllamaProblem;
 }
 
 // How a user installs this engine; onboarding, the picker and settings render from it.
@@ -429,6 +455,9 @@ export interface StandaloneRelease {
   /** Environment for the app's own copy only, such as turning off the vendor's self-updater. */
   runEnv?: Readonly<Record<string, string>>;
   assets: Partial<Record<StandalonePlatform, StandaloneAsset>>;
+  /** The program is a launcher that runs the rest of its folder (Cursor's runs a node and scripts beside it), so bin/
+   * holds a link to it rather than a copy. POSIX only. */
+  launcher?: true;
   /** Program SHA-256s of earlier pinned versions, per platform: a copy of one of those stays usable after the pin moves
    * on, until it is updated. Nothing in the data folder can add to this list. */
   previousPrograms?: Partial<Record<StandalonePlatform, readonly string[]>>;
@@ -444,7 +473,8 @@ export interface ProviderAuthenticationStart {
 }
 
 export interface ProviderAuthenticationStatus extends Omit<ProviderAuthenticationStart, "phase"> {
-  phase: "waiting" | "succeeded" | "failed" | "expired" | "cancelled";
+  /** `verifying`: the person's part is done and the provider is finishing the sign-in. */
+  phase: "waiting" | "verifying" | "succeeded" | "failed" | "expired" | "cancelled";
   /** Safe, actionable copy; never unfiltered CLI output or credentials. */
   message?: string;
 }
@@ -464,6 +494,9 @@ export interface ModelCatalog {
     variants?: ModelVariantOption[];
     /** The organization of the signed-in account turned this model off: the engine would answer with another. */
     orgBlocked?: true;
+    /** The installed CLI is too old for this model: the version it needs. */
+    needsCliUpdate?: string;
+    local?: LocalModelFacts;
   }>;
 }
 
@@ -532,6 +565,8 @@ export interface ProviderInstance {
   readonly displayName: string | undefined;
   readonly enabled: boolean;
   readonly models: ModelCatalog;
+  /** True while the catalog is the driver's fixed list or a failed read's leftover, not a list the engine gave. */
+  readonly modelsUnconfirmed?: boolean;
   /** False while the sign-in can refuse a model its catalog lists (Codex on a ChatGPT account): a short message and background text then stay on the bot's own model. */
   readonly quickModelsUsable?: () => boolean;
   /** Refresh a live catalog without recreating the provider instance. */
@@ -541,7 +576,8 @@ export interface ProviderInstance {
   /** Optional first-party runtime installation and account setup. */
   readonly installRuntime?: () => Promise<void>;
   readonly startAuthentication?: () => Promise<ProviderAuthenticationStart>;
-  readonly authenticationMethod?: "browser-pkce";
+  /** Named when the calls an instance offers do not tell its sign-in apart; `callback-url` is a link plus a redirect URL pasted back. */
+  readonly authenticationMethod?: "browser-pkce" | "browser" | "callback-url";
   readonly getAuthentication?: (flowId: string) => Promise<ProviderAuthenticationStatus>;
   readonly completeAuthentication?: (flowId: string, callbackUrl: string) => Promise<void>;
   readonly cancelAuthentication?: () => Promise<void>;
@@ -570,6 +606,8 @@ export interface ProviderDriver<Config = unknown> {
     displayName: string;
     supportsMultipleInstances?: boolean;
     access?: EngineAccess;
+    /** What the engine's own CLI answers to `--version`; another answer means the CLI path runs another program. */
+    cliVersion?: RegExp;
   };
   /** Omit for engines that need no local binary (API-key drivers). */
   readonly install?: EngineInstall;

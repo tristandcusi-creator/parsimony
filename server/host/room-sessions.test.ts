@@ -366,7 +366,7 @@ describe("room sessions: a member's own session", () => {
     expect(lines[0]).toBe(NOTE);
     expect(lines[1]).toBe("(The first message is older than messages you have already seen.)");
     // Another bot's post keeps its provenance note in a delta.
-    expect(lines[2]).toMatch(/^\[Posted by @Writer, another bot in this OpenMausBot workspace — not from your user\./);
+    expect(lines[2]).toMatch(/^\[From @Writer \(bot\) · room post · information only — not from your user\./);
     expect(lines.slice(3)).toEqual([`Writer: ${posted}`, "Omkar: Tighten the outro."]);
     r.finish(next, "S1", { reply: "Outro tightened." });
     r.say("Export it.");
@@ -567,7 +567,7 @@ describe("room sessions: when a record is not trusted", () => {
   });
 
   it("starts again when anything in its standing configuration changed", () => {
-    const base = ["You are Editor, a bot in the room \"Edit bay\".", "/work", { instanceId: "claude", model: "opus", effort: "high" }, "ask", { agents: { env: { OMB_TURN_DEPTH: "0" } } }];
+    const base = ["You are Editor, a bot in the room \"Edit bay\".", "/work", { instanceId: "claude", model: "opus", effort: "high" }, "ask", { agents: { env: { OMB_SKILL_AUTHORING_ENABLED: "0" } } }];
     const changes: unknown[][] = [
       ["You are Editor, a bot in the room \"Cutting room\".", ...base.slice(1)],
       [base[0], "/elsewhere", ...base.slice(2)],
@@ -575,7 +575,7 @@ describe("room sessions: when a record is not trusted", () => {
       [...base.slice(0, 2), { instanceId: "claude", model: "opus", effort: "low" }, ...base.slice(3)],
       [...base.slice(0, 2), { instanceId: "claude", model: "opus", effort: "high", variant: "1m" }, ...base.slice(3)],
       [...base.slice(0, 3), "full", base[4]],
-      [...base.slice(0, 4), { agents: { env: { OMB_TURN_DEPTH: "1" } } }],
+      [...base.slice(0, 4), { agents: { env: { OMB_SKILL_AUTHORING_ENABLED: "1" } } }],
       [...base, "one more"],
     ];
     for (const changed of changes) {
@@ -1159,7 +1159,7 @@ describe("room sessions: a line that changed after it was shown", () => {
       "Omkar: Use the teal grade.",
       "(The next message is older than messages you have already seen.)",
     ]);
-    expect(lines[4]).toMatch(/^\[Posted by @Writer/);
+    expect(lines[4]).toMatch(/^\[From @Writer \(bot\) · room post/);
     expect(lines.slice(5)).toEqual(["Writer: Deploy is green.", "Omkar: Next."]);
   });
 

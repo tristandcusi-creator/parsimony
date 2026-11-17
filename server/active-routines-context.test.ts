@@ -88,4 +88,9 @@ describe("activeRoutinesContext", () => {
     expect(built.volatile).toContain('"id":"safe"');
     expect(built.stable).not.toContain('"id":"safe"');
   });
+  it("omits automation inventory for unrelated requests but retains it for routine work", () => {
+    const routines = [routine("payment")];
+    expect(context(routines, { query: "Summarize this page" })).toBe("");
+    expect(context(routines, { query: "Is the payment monitor still active?" })).toContain('"id":"payment"');
+  });
 });

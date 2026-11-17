@@ -18,11 +18,15 @@ const priority = ({ schedule }: { schedule: { type: string; endsAt?: number } })
 export function activeRoutinesContext(input: {
   botId: string;
   routines: readonly Routine[];
+  query?: string;
   appTriggers?: readonly EventMonitor[];
   webhooks?: readonly (EventMonitor & { delivery?: string; groupId?: string })[];
   include?: (threadId: string) => boolean;
   title?: (threadId: string) => string | null | undefined;
 }): string {
+  const asksAboutAutomation = input.query !== undefined && /\b(?:automation|routine|trigger|webhook|schedule|monitor|reminder|remind|alert|cron|recurring|daily|weekly|monthly|automatic)\w*\b|\b(?:when|whenever|every|each)\b/i.test(input.query);
+  const completionQuery = input.query !== undefined && /\b(?:done|finish(?:ed)?|complete(?:d)?|deliver(?:ed|y)?|success(?:ful(?:ly)?)?|pause|stop)\b/i.test(input.query);
+  const queryTerms = new Set(input.query?.toLowerCase().match(/[\p{L}\p{N}]{6,}/gu) ?? []);
   const candidates = [
     ...input.routines.filter(routine => routine.target === "bot"),
     ...(input.appTriggers ?? []).map(trigger => ({ ...trigger, schedule: { type: "app_event" }, nextRunAt: null })),
@@ -31,6 +35,10 @@ export function activeRoutinesContext(input: {
   ];
   const eligible = candidates.filter(routine => {
     if (!routine.enabled || routine.botId !== input.botId) return false;
+    if (input.query !== undefined && !asksAboutAutomation) {
+      const routineTerms = `${routine.name} ${routine.prompt}`.toLowerCase().match(/[\p{L}\p{N}]{6,}/gu) ?? [];
+      if (!routineTerms.some(term => queryTerms.has(term)) && !(completionQuery && priority(routine) === 0)) return false;
+    }
     // Scoped turns need known, readable provenance; results may have a narrower audience too.
     return !input.include || Boolean(routine.sourceThreadId && input.include(routine.sourceThreadId) &&
       (!routine.resultsThreadId || input.include(routine.resultsThreadId)));

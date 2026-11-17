@@ -1,8 +1,10 @@
 # Conversation context compaction
 
 Long direct conversations can summarize older exchanges before the next turn.
-The full transcript, its branches and attachments are retained. The new session
-gets a bounded summary plus recent exchanges; later turns resume that session.
+The full transcript, its branches and attachments are retained.
+The new session gets one bounded summary: a model overview plus up to 1.2 KB of
+exact recent excerpts, or deterministic excerpts if no helper succeeds. Recent
+exchanges are capped at 8 KB per message; later turns resume that session.
 A visible, expandable note explains what was summarized, even with tool chips off;
 when no model wrote the summary, it says the agent continues from recent excerpts only.
 

@@ -67,6 +67,8 @@ describe("recentWorkLines + recentWorkPrompt", () => {
     expect(text).toContain('- today 09:05 · 1:1 with Milind · "Invoice reconciliation" · you said: "Sent the three flagged invoices to finance; two are still missing a PO."');
     expect(text).toContain('- yesterday 17:40 · room "Ops" · you said: "I\'ll take the deploy tomorrow morning."');
     expect(text).toContain("session_search with since");
+    expect(recentWorkPrompt(lines, now, "Summarize this email")).toBe("");
+    expect(recentWorkPrompt(lines, now, "Continue the invoice reconciliation from our other chat")).toContain("Invoice reconciliation");
     expect(recentWorkPrompt([], now)).toBe("");
   });
 

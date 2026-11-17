@@ -1,5 +1,6 @@
 // MiniMax's api.minimax.io/v1 closes the connection after the finish_reason chunk without `data: [DONE]`,
 // and reports account failures as HTTP 200 with a JSON `base_resp` body.
+import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +8,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ensureDirs, NATIVE_DIR } from "../config.ts";
 import { discardNativeLog, flushNativeLog } from "./native.ts";
+import { compactConsumedToolResults, createOpenAIChatRuntime } from "./openai-chat.ts";
+import type { OpenAIChatMessage } from "./openai-chat.ts";
 import type { RuntimeEvent, SendTurnInput } from "../contracts.ts";
 import { GrokDriver } from "./grok.ts";
 import { MinimaxDriver } from "./minimax.ts";
@@ -14,8 +17,22 @@ import { OpenAICompatDriver } from "./openai-compat.ts";
 import { MistralDriver } from "./mistral.ts";
 import { startFakeHttpMcp } from "../testing/fake-http-mcp-server.ts";
 import { whopLikeCatalog } from "../testing/whop-like-catalog.ts";
+import { handoffDir } from "../turn-continuation.ts";
 
 afterEach(() => vi.unstubAllGlobals());
+
+it("compacts consumed tool results while preserving their page references and call ids", () => {
+  const compact = JSON.stringify({ ok: true, result: "short preview; read_tool_output ref abc" });
+  const messages: OpenAIChatMessage[] = [
+    { role: "tool", tool_call_id: "large", content: JSON.stringify({ ok: true, result: "full preview" }) },
+    { role: "tool", tool_call_id: "small", content: JSON.stringify({ ok: true, result: "small result" }) },
+  ];
+  const pending = new Map([["large", compact]]);
+  compactConsumedToolResults(messages, pending);
+  expect(messages.find((message) => message.tool_call_id === "large")).toMatchObject({ tool_call_id: "large", content: compact });
+  expect(messages.find((message) => message.tool_call_id === "small")?.content).toContain("small result");
+  expect(pending.size).toBe(0);
+});
 
 const sse = (body: string) => new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
 
@@ -43,6 +60,30 @@ async function runTurn(body: string | (() => Response), driver: "openai-compat" 
   await instance.dispose();
   return events;
 }
+
+it("sends the selected OpenRouter effort instead of silently ignoring it", async () => {
+  vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+    if (String(url).endsWith("/models")) return Response.json({ data: [{ id: "openai/gpt-5" }] });
+    const body = JSON.parse(String(init?.body));
+    if (body.reasoning?.effort !== "xhigh") return new Response("missing reasoning effort", { status: 400 });
+    return sse(`data: ${JSON.stringify({ choices: [{ delta: { content: "done" }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`);
+  }));
+  const instance = await OpenAICompatDriver.create({
+    instanceId: "router", displayName: "Renamed engine", enabled: true,
+    config: OpenAICompatDriver.decodeConfig({ url: "https://openrouter.ai/api/v1", apiKeyEnv: "ROUTER_KEY", model: "openai/gpt-5" }),
+    environment: { ROUTER_KEY: "test-key" },
+  });
+  const completion = Promise.withResolvers<RuntimeEvent>();
+  instance.adapter.onEvent((event) => { if (event.type === "turn.completed") completion.resolve(event); });
+  try {
+    await instance.adapter.sendTurn({ threadId: "effort-thread", text: "hi", effort: "xhigh" });
+    const completed = await completion.promise;
+    expect(completed?.type === "turn.completed" && completed.ok).toBe(true);
+    expect(instance.adapter.capabilities.effortLevels).toContain("xhigh");
+  } finally {
+    await instance.dispose();
+  }
+});
 
 describe("createOpenAIChatRuntime one-shot usage", () => {
   const fixture = async (body: unknown) => {
@@ -117,7 +158,7 @@ describe("createOpenAIChatRuntime tool approvals", () => {
   const mcpDir: string[] = [];
   afterEach(() => { for (const d of mcpDir.splice(0)) rmSync(d, { recursive: true, force: true }); });
 
-  const toolServer = (receipt?: string): { command: string; args: string[]; env: Record<string, string> } => {
+  const toolServer = (receipt?: string, outputText = "done"): { command: string; args: string[]; env: Record<string, string> } => {
     const dir = mkdtempSync(join(tmpdir(), "omb-chat-approval-"));
     mcpDir.push(dir);
     const script = join(dir, "fake-mcp.mjs");
@@ -136,7 +177,7 @@ describe("createOpenAIChatRuntime tool approvals", () => {
           else if (m.method === "tools/list") send({jsonrpc:"2.0",id:m.id,result:{tools:[{name:"write",description:"Fixture write",inputSchema:{type:"object",properties:{},additionalProperties:false}}]}});
           else if (m.method === "tools/call") {
             if (process.env.RECEIPT) appendFileSync(process.env.RECEIPT, m.params.name + "\\n");
-            send({jsonrpc:"2.0",id:m.id,result:{content:[{type:"text",text:"done"}]}});
+            send({jsonrpc:"2.0",id:m.id,result:{content:[{type:"text",text:${JSON.stringify(outputText)}}]}});
           }
         }
       });
@@ -144,6 +185,74 @@ describe("createOpenAIChatRuntime tool approvals", () => {
     chmodSync(script, 0o755);
     return { command: script, args: [], env: receipt ? { RECEIPT: receipt } : {} };
   };
+
+  it("pages a real MCP result and shrinks its replayed payload on the next API round", async () => {
+    const botId = "paging-bot";
+    const threadId = `paging-${randomUUID()}`;
+    const outputDir = join(handoffDir(), "tool-output", createHash("sha256").update(JSON.stringify([botId, threadId])).digest("hex"));
+    mcpDir.push(outputDir);
+    const output = `${"x".repeat(9_000)}DETAIL-EXACT:${"y".repeat(9_000)}`;
+    type CapturedMessage = { role: string; tool_call_id?: string; content?: unknown };
+    type CapturedRequest = { messages: CapturedMessage[] };
+    const requests: CapturedRequest[] = [];
+    let ref = "";
+    const toolCall = (id: string, name: string, args: unknown) =>
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id, type: "function", function: { name, arguments: JSON.stringify(args) } }] } }] })}\n\n`
+      + 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+      + "data: [DONE]\n\n";
+    const final = 'data: {"choices":[{"index":0,"delta":{"content":"Finished."}}]}\n\n'
+      + 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+      + "data: [DONE]\n\n";
+    vi.stubGlobal("fetch", vi.fn(async (input: unknown, init?: RequestInit) => {
+      if (!String(input).endsWith("/chat/completions")) return new Response(JSON.stringify({ data: [] }));
+      requests.push(JSON.parse(String(init?.body)) as CapturedRequest);
+      if (requests.length === 1) return sse(toolCall("call-1", "fx_write", {}));
+      if (requests.length === 2) {
+        const message = requests[1]!.messages.find((entry) => entry.role === "tool" && entry.tool_call_id === "call-1");
+        if (!message || typeof message.content !== "string") throw new Error("large MCP result was not returned");
+        const result = JSON.parse(message.content) as { result: string };
+        ref = /ref "([0-9a-f]{64})"/.exec(result.result)?.[1] ?? "";
+        if (!ref) throw new Error("large MCP result did not expose a page ref");
+        return sse(toolCall("call-2", "read_tool_output", { ref, offset: 9_000, limit: 13 }));
+      }
+      return sse(final);
+    }));
+    const instance = await OpenAICompatDriver.create({
+      instanceId: "paged-output", displayName: "Paged output fixture", enabled: true,
+      config: OpenAICompatDriver.decodeConfig({ url: "https://api.example.test/v1", apiKeyEnv: "K", model: "fixture" }),
+      environment: { K: "synthetic" },
+    });
+    const events: RuntimeEvent[] = [];
+    instance.adapter.onEvent((event) => events.push(event));
+    try {
+      await instance.adapter.sendTurn({
+        botId, threadId, text: "Fetch the exact marker from the large tool result.", approvalMode: "full",
+        integrations: { custom: { fx: toolServer(undefined, output) } },
+      });
+      await vi.waitFor(() => expect(requests).toHaveLength(3), { timeout: 10_000 });
+      await vi.waitFor(() => expect(events.at(-1)).toMatchObject({ type: "turn.completed", ok: true }), { timeout: 10_000 });
+
+      const initial = requests[1]!.messages.find((entry) => entry.role === "tool" && entry.tool_call_id === "call-1");
+      const compacted = requests[2]!.messages.find((entry) => entry.role === "tool" && entry.tool_call_id === "call-1");
+      const pageMessage = requests[2]!.messages.find((entry) => entry.role === "tool" && entry.tool_call_id === "call-2");
+      expect(initial && typeof initial.content === "string").toBe(true);
+      expect(compacted && typeof compacted.content === "string").toBe(true);
+      expect(pageMessage && typeof pageMessage.content === "string").toBe(true);
+      const fullContent = initial!.content as string;
+      const compactContent = compacted!.content as string;
+      const pageContent = pageMessage!.content as string;
+      const fullResult = JSON.parse(fullContent) as { result: string };
+      const compactResult = JSON.parse(compactContent) as { result: string };
+      const pageResult = JSON.parse(pageContent) as { result: string };
+      expect(fullResult.result).not.toContain("DETAIL-EXACT:");
+      expect(compactResult.result).toContain(ref);
+      expect(Buffer.byteLength(compactContent)).toBeLessThan(Buffer.byteLength(fullContent) / 3);
+      expect(Buffer.byteLength(JSON.stringify(requests[2]!))).toBeLessThan(Buffer.byteLength(JSON.stringify(requests[1]!)));
+      expect((JSON.parse(pageResult.result) as { text: string }).text).toBe("DETAIL-EXACT:");
+    } finally {
+      await instance.dispose();
+    }
+  }, 20_000);
 
   it.each(["openai", "grok", "mistral", "minimax"] as const)("scopes %s schemas and blocks a remembered native question even under Full access", async (driver) => {
     const dir = mkdtempSync(join(tmpdir(), "omb-api-scope-")); mcpDir.push(dir);
@@ -180,6 +289,125 @@ describe("createOpenAIChatRuntime tool approvals", () => {
       expect(withheld.content).toMatch(/tool selection excludes/i);
       expect(events.at(-1)).toMatchObject({ type: "turn.completed", ok: false });
     } finally { await instance.dispose(); }
+  }, 20_000);
+  it.each(["openai-compat", "minimax"] as const)("%s preserves tool-call reasoning and continuation while suppressing completed reasoning replay", async (driver) => {
+    type CapturedMessage = {
+      role: string;
+      content?: string | null;
+      reasoning_content?: string;
+      tool_call_id?: string;
+      reasoning_details?: Array<Record<string, unknown>>;
+      tool_calls?: Array<{ id: string; type: string; function: { name: string; arguments: string } }>;
+    };
+    type CapturedRequest = { messages: CapturedMessage[] };
+
+    const dir = mkdtempSync(join(tmpdir(), "omb-reasoning-replay-"));
+    mcpDir.push(dir);
+    const receipt = join(dir, "calls.txt");
+    const toolReasoningDetails = [{ type: "reasoning.text", text: "required tool-call reasoning detail" }];
+    const announcement = "I will now check the result.";
+    const first = `data: ${JSON.stringify({ choices: [{ index: 0, delta: {
+      reasoning_content: "required tool-call reasoning",
+      reasoning_details: toolReasoningDetails,
+      tool_calls: [{ index: 0, id: "call-1", type: "function", function: { name: "fx_write", arguments: "{}" } }],
+    } }] })}\n\n`
+      + 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+      + "data: [DONE]\n\n";
+    const announced = `data: ${JSON.stringify({ choices: [{ index: 0, delta: {
+      content: announcement,
+      reasoning_content: "optional completed reasoning",
+      reasoning_details: [{ type: "reasoning.text", text: "optional completed reasoning detail" }],
+    } }] })}\n\n`
+      + 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+      + "data: [DONE]\n\n";
+    const final = 'data: {"choices":[{"index":0,"delta":{"content":"Finished."}}]}\n\n'
+      + 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+      + "data: [DONE]\n\n";
+    const streams = [first, announced, final];
+    const requests: CapturedRequest[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: unknown, init?: RequestInit) => {
+      if (!String(input).endsWith("/chat/completions")) return new Response(JSON.stringify({ data: [] }));
+      requests.push(JSON.parse(String(init?.body)) as CapturedRequest);
+      return new Response(streams[Math.min(requests.length - 1, streams.length - 1)]!, {
+        headers: { "content-type": "text/event-stream" },
+      });
+    }));
+
+    const minimaxConfig = MinimaxDriver.defaultConfig();
+    const minimaxApiKey = "secret";
+    const instance = driver === "minimax"
+      ? await createOpenAIChatRuntime({
+          input: {
+            instanceId: "reasoning-replay",
+            displayName: "Reasoning replay fixture",
+            enabled: true,
+            config: minimaxConfig,
+            environment: { MINIMAX_API_KEY: minimaxApiKey },
+          },
+          driverKind: MinimaxDriver.driverKind,
+          apiKey: minimaxApiKey,
+          apiUrl: minimaxConfig.url ?? "",
+          tools: minimaxConfig.tools,
+          models: () => MinimaxDriver.models,
+          requestBody: (model, messages, stream) => ({
+            model,
+            messages,
+            stream,
+            reasoning_split: true,
+            stream_options: stream ? { include_usage: true } : undefined,
+          }),
+          httpErrorLabel: "MiniMax",
+          missingKeyError: "no MiniMax key â€” set MINIMAX_API_KEY or run mmx auth login --api-key â€¦",
+          unavailableReason: "no MiniMax API key â€” run mmx auth login --api-key â€¦ or set MINIMAX_API_KEY",
+          timeoutMs: 180_000,
+          reasoning: true,
+          billing: "metered",
+          includeUsageInCompleted: true,
+          noBodyError: "MiniMax returned no response body",
+          nativeLog: {
+            source: "minimax.chat.completions",
+            outgoing: (_turn, messages, model) => ({ model, messageCount: messages.length }),
+            incoming: ({ text, usage }) => ({ textLength: text.length, usage }),
+          },
+          nudgeAnnouncedAction: true,
+        })
+      : await OpenAICompatDriver.create({
+          instanceId: "reasoning-replay",
+          displayName: "Reasoning replay fixture",
+          enabled: true,
+          config: OpenAICompatDriver.decodeConfig({ url: "https://api.example.test/v1", apiKeyEnv: "K", model: "fixture" }),
+          environment: { K: "secret" },
+        });
+    const events: RuntimeEvent[] = [];
+    instance.adapter.onEvent((event) => events.push(event));
+    try {
+      await instance.adapter.sendTurn({
+        threadId: "reasoning-replay",
+        text: "Use the selected write tool.",
+        approvalMode: "full",
+        toolScope: { allow: ["mcp:fx:write"] },
+        integrations: { custom: { fx: toolServer(receipt) } },
+      });
+      await vi.waitFor(() => expect(requests).toHaveLength(3), { timeout: 10_000 });
+      await vi.waitFor(() => expect(events.at(-1)).toMatchObject({ type: "turn.completed", ok: true }), { timeout: 10_000 });
+
+      const continuation = requests[1]!.messages.find((message) => message.role === "assistant" && message.tool_calls?.length);
+      expect(continuation).toMatchObject({
+        role: "assistant",
+        reasoning_content: "required tool-call reasoning",
+        reasoning_details: toolReasoningDetails,
+        tool_calls: [{ id: "call-1", type: "function", function: { name: "fx_write" } }],
+      });
+      const toolReply = requests[1]!.messages.find((message) => message.role === "tool");
+      expect(toolReply).toMatchObject({ role: "tool", tool_call_id: "call-1" });
+      const completedReplay = requests[2]!.messages.find((message) => message.role === "assistant" && message.content === announcement);
+      expect(completedReplay).toBeDefined();
+      expect(completedReplay).not.toHaveProperty("reasoning_content");
+      expect(completedReplay).not.toHaveProperty("reasoning_details");
+      expect(readFileSync(receipt, "utf8")).toBe("write\n");
+    } finally {
+      await instance.dispose();
+    }
   }, 20_000);
 
   const cardRaisedFor = async (approvalMode: "ask" | "full", approvalModeNow?: () => "ask" | "full") => {
@@ -321,7 +549,7 @@ describe("createOpenAIChatRuntime tool approvals", () => {
       expect(completed.stopReason).toBe("tool_error");
       // It says which call failed, so a routine's log and the person read the cause.
       expect(events.filter((event) => event.type === "runtime.error").map((event) => (event as any).message))
-        .toEqual(["Stopped because the tool call “fx_write” failed. The bot's reply isn't proof the work was done; the failed step shows the error."]);
+        .toEqual(["Stopped because the tool call â€œfx_writeâ€� failed. The bot's reply isn't proof the work was done; the failed step shows the error."]);
       expect(events.some((event) => event.type === "cap.exhausted")).toBe(false);
     } finally {
       await instance.dispose();
@@ -355,7 +583,7 @@ describe("createOpenAIChatRuntime tool approvals", () => {
       await vi.waitFor(() => expect(events.some((event) => event.type === "turn.completed")).toBe(true), { timeout: 15_000 });
       expect(remote.calls).toEqual([call]);
       expect(events.filter((event) => event.type === "runtime.error").map((event) => (event as any).message))
-        .toEqual(["Stopped because the tool call “whop_payments_list” failed. The bot's reply isn't proof the work was done; the failed step shows the error."]);
+        .toEqual(["Stopped because the tool call â€œwhop_payments_listâ€� failed. The bot's reply isn't proof the work was done; the failed step shows the error."]);
     } finally {
       await instance.dispose();
       await remote.close();
@@ -368,7 +596,10 @@ describe("createOpenAIChatRuntime tool approvals", () => {
       + 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n';
     const answer = 'data: {"choices":[{"index":0,"delta":{"content":"Done."}}]}\n\n'
       + 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n';
-    const run = async (replies: string[], rounds?: number, integrations?: SendTurnInput["integrations"]) => {
+    const emptyArgumentsToolCall = (id: string, name: string, argumentsText: string) =>
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id, type: "function", function: { name, arguments: argumentsText } }] } }] })}\n\n`
+      + 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n';
+    const run = async (replies: string[], rounds?: number, integrations?: SendTurnInput["integrations"], events: RuntimeEvent[] = []) => {
       const bodies: any[] = [];
       vi.stubGlobal("fetch", vi.fn(async (input: unknown, init?: RequestInit) => {
         if (!String(input).endsWith("/chat/completions")) return new Response(JSON.stringify({ data: [] }));
@@ -380,7 +611,6 @@ describe("createOpenAIChatRuntime tool approvals", () => {
         config: OpenAICompatDriver.decodeConfig({ url: "https://api.example.test/v1", apiKeyEnv: "K", model: "fixture" }),
         environment: { K: "synthetic" },
       });
-      const events: RuntimeEvent[] = [];
       instance.adapter.onEvent((event) => events.push(event));
       try {
         await instance.adapter.sendTurn({
@@ -389,14 +619,43 @@ describe("createOpenAIChatRuntime tool approvals", () => {
         });
         await vi.waitFor(() => expect(events.some((event) => event.type === "turn.completed")).toBe(true), { timeout: 10_000 });
       } finally { await instance.dispose(); }
-      const corrective = bodies.at(-1)!.messages.filter((message: any) => message.role === "user" && /Re-run the failed/.test(String(message.content)));
+      const corrective = bodies.at(-1)!.messages.filter((message: { role: string }) => message.role === "user").length - bodies[0]!.messages.filter((message: { role: string }) => message.role === "user").length;
       const completed = events.find((event) => event.type === "turn.completed") as any;
-      return { requests: bodies.length, corrective: corrective.length, ok: completed.ok, stopReason: completed.stopReason };
+      return { requests: bodies.length, corrective, ok: completed.ok, stopReason: completed.stopReason };
     };
+
+    it("publishes only the accepted final report after a corrective round", async () => {
+      const events: RuntimeEvent[] = [];
+      const result = await run(
+        [toolCall("c1", "nope"), answer, toolCall("c2", "fx_write"), answer],
+        1, { custom: { fx: toolServer() } }, events,
+      );
+      expect(result.ok).toBe(true);
+      expect(events.flatMap((event) => event.type === "item.completed" && event.itemType === "assistant_text"
+        ? [event.text] : [])).toEqual(["Done."]);
+    }, 20_000);
+
+    it("does not publish an announcement that is being nudged to continue", async () => {
+      const events: RuntimeEvent[] = [];
+      const result = await run(
+        [toolCall("c1", "fx_write"), answer.replace("Done.", "I will now check the result."), toolCall("c2", "fx_write"), answer],
+        undefined, { custom: { fx: toolServer() } }, events,
+      );
+      expect(result.ok).toBe(true);
+      expect(events.flatMap((event) => event.type === "item.completed" && event.itemType === "assistant_text"
+        ? [event.text] : [])).toEqual(["Done."]);
+    }, 20_000);
 
     it("sends a failed call back once per round, then ends the turn as failed", async () => {
       expect(await run([toolCall("c1", "nope"), answer, toolCall("c2", "nope"), answer], 1))
         .toEqual({ requests: 4, corrective: 1, ok: false, stopReason: "tool_error" });
+    }, 20_000);
+
+    it.each(["", " \t\n "])("treats whitespace-only tool arguments as an empty object (%j)", async (argumentsText) => {
+      expect(await run([
+        emptyArgumentsToolCall("c1", "fx_write", argumentsText),
+        answer,
+      ], undefined, { custom: { fx: toolServer() } })).toMatchObject({ requests: 2, ok: true });
     }, 20_000);
 
     it("keeps the failure when the bot answers the round without running a tool", async () => {
@@ -416,10 +675,129 @@ describe("createOpenAIChatRuntime tool approvals", () => {
         .toEqual({ requests: 5, corrective: 1, ok: false, stopReason: "tool_error" });
     }, 20_000);
 
-    it("without rounds, a later call that succeeds does not clear the failure", async () => {
+    it("without rounds, a bot that went on to run tools after a failure ends ok; one whose last calls failed does not", async () => {
+      // Seen on a hosted model: 137 turns in a week ended failed for one bad query the bot had already worked around.
       expect(await run([toolCall("c1", "nope"), toolCall("c2", "fx_write"), answer], undefined, { custom: { fx: toolServer() } }))
+        .toEqual({ requests: 3, corrective: 0, ok: true, stopReason: null });
+      expect(await run([toolCall("c1", "fx_write"), toolCall("c2", "nope"), answer], undefined, { custom: { fx: toolServer() } }))
         .toEqual({ requests: 3, corrective: 0, ok: false, stopReason: "tool_error" });
     }, 20_000);
+    it("does not re-run or verify success after an uncertain native failure", async () => {
+      expect(await run([toolCall("c1", "powershell", { script: "exit 1" }), answer], 1, { custom: { fx: toolServer() } }))
+        .toEqual({ requests: 2, corrective: 0, ok: false, stopReason: "tool_error" });
+    }, 20_000);
+  });
+
+  describe("tool repeat guard on API models", () => {
+    const toolCall = (id: string, name: string, args: unknown = {}) =>
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id, type: "function", function: { name, arguments: JSON.stringify(args) } }] } }] })}\n\n`
+      + 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n';
+    const answer = 'data: {"choices":[{"index":0,"delta":{"content":"Done."}}]}\n\n'
+      + 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n';
+
+    const failingToolServer = () => {
+      const dir = mkdtempSync(join(tmpdir(), "omb-chat-repguard-"));
+      const script = join(dir, "fake-repeat-mcp.mjs");
+      writeFileSync(script, `#!/usr/bin/env node
+        const send = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
+        let buffer = "";
+        process.stdin.setEncoding("utf8");
+        process.stdin.on("data", (chunk) => {
+          buffer += chunk;
+          let nl;
+          while ((nl = buffer.indexOf("\\n")) !== -1) {
+            const line = buffer.slice(0, nl); buffer = buffer.slice(nl + 1);
+            const m = JSON.parse(line);
+            if (m.method === "initialize") send({jsonrpc:"2.0",id:m.id,result:{protocolVersion:"2024-11-05",capabilities:{tools:{}}}});
+            else if (m.method === "tools/list") send({jsonrpc:"2.0",id:m.id,result:{tools:[{name:"write",description:"Fixture write",inputSchema:{type:"object",properties:{path:{type:"string"}},required:["path"],additionalProperties:false}}]}});
+            else if (m.method === "tools/call") send({jsonrpc:"2.0",id:m.id,result:{isError:true,content:[{type:"text",text:"boom"}]}});
+          }
+        });
+      `);
+      chmodSync(script, 0o755);
+      return { command: script, args: [], env: {} };
+    };
+
+    const failingFx = async (turn: { threadId: string; text: string; toolRepeatGuard?: boolean; args?: unknown; steps?: string[] }) => {
+      const replies = [toolCall(`c1-${turn.threadId}`, "fx_write", turn.args ?? {}), ...(turn.steps ?? [answer])];
+      const bodies: any[] = [];
+      vi.stubGlobal("fetch", vi.fn(async (input: unknown, init?: RequestInit) => {
+        if (!String(input).endsWith("/chat/completions")) return new Response(JSON.stringify({ data: [] }));
+        const i = bodies.push(JSON.parse(String(init?.body))) - 1;
+        return new Response(replies[i] ?? answer, { headers: { "content-type": "text/event-stream" } });
+      }));
+      const fx = failingToolServer();
+      const instance = await OpenAICompatDriver.create({
+        instanceId: `repguard-${turn.threadId}`, displayName: "Synthetic", enabled: true,
+        config: OpenAICompatDriver.decodeConfig({ url: "https://api.example.test/v1", apiKeyEnv: "K", model: "fixture" }),
+        environment: { K: "synthetic" },
+      });
+      const events: RuntimeEvent[] = [];
+      instance.adapter.onEvent((event) => events.push(event));
+      try {
+        await instance.adapter.sendTurn({
+          threadId: turn.threadId, text: turn.text, approvalMode: "full",
+          ...(turn.toolRepeatGuard ? { toolRepeatGuard: true } : {}), integrations: { custom: { fx } },
+        });
+        await vi.waitFor(() => expect(events.some((event) => event.type === "turn.completed")).toBe(true), { timeout: 15_000 });
+      } finally {
+        await instance.dispose();
+        rmSync(fx.command, { force: true });
+        rmSync(join(fx.command, ".."), { recursive: true, force: true });
+      }
+      const completed = events.find((event) => event.type === "turn.completed") as any;
+      return { requests: bodies.length, ok: completed.ok, stopReason: completed.stopReason, bodies };
+    };
+
+    it("notes an ill-typed preflight call and answers once the model corrects it, without ending the turn as failed", async () => {
+      const run = await failingFx({ threadId: "guard-preflight", text: "Use the tool, then answer.", toolRepeatGuard: true });
+      expect(run).toMatchObject({ requests: 2, ok: true });
+      expect(run.stopReason).not.toBe("tool_error");
+      const toolResult = run.bodies.at(-1)!.messages.filter((message: any) => message.role === "tool").at(-1);
+      expect(JSON.parse(toolResult.content)).toMatchObject({ ok: false });
+    }, 30_000);
+
+    it("without the guard, the same ill-typed call still ends the turn as a tool failure", async () => {
+      expect(await failingFx({ threadId: "guard-off-preflight", text: "Use the tool, then answer." }))
+        .toMatchObject({ requests: 2, ok: false, stopReason: "tool_error" });
+    }, 30_000);
+
+    it("still ends the turn on a failed executed call", async () => {
+      expect(await failingFx({ threadId: "guard-exec-fail", text: "Use the tool, then answer.", args: { path: "coattail.txt" } }))
+        .toMatchObject({ requests: 2, ok: false, stopReason: "tool_error" });
+    }, 30_000);
+
+    it("stops a turn stuck on one identical failing call and answers a clean next turn", async () => {
+      const fx = failingToolServer();
+      const instance = await OpenAICompatDriver.create({
+        instanceId: "repguard-stop", displayName: "Synthetic", enabled: true,
+        config: OpenAICompatDriver.decodeConfig({ url: "https://api.example.test/v1", apiKeyEnv: "K", model: "fixture" }),
+        environment: { K: "synthetic" },
+      });
+      const events: RuntimeEvent[] = [];
+      instance.adapter.onEvent((event) => events.push(event));
+      let sent = 0;
+      vi.stubGlobal("fetch", vi.fn(async (input: unknown, init?: RequestInit) => {
+        if (!String(input).endsWith("/chat/completions")) return new Response(JSON.stringify({ data: [] }));
+        void JSON.parse(String(init?.body));
+        return new Response(++sent <= 5 ? toolCall(`c${sent}`, "fx_write") : answer, { headers: { "content-type": "text/event-stream" } });
+      }));
+      try {
+        await instance.adapter.sendTurn({ threadId: "guard-stop", text: "Use the tool, then answer.", approvalMode: "full",
+          integrations: { custom: { fx } } });
+        await vi.waitFor(() => expect(events.filter((event) => event.type === "turn.completed").length).toBe(1), { timeout: 20_000 });
+        const first = events.find((event) => event.type === "turn.completed") as any;
+        expect(first).toMatchObject({ ok: false, stopReason: "incomplete_action" });
+        expect(sent).toBe(5);
+        await instance.adapter.sendTurn({ threadId: "guard-stop", text: "Just answer.", approvalMode: "full" } as SendTurnInput);
+        await vi.waitFor(() => expect(events.filter((event) => event.type === "turn.completed").length).toBe(2), { timeout: 20_000 });
+        expect((events.filter((event) => event.type === "turn.completed").at(-1) as any).ok).toBe(true);
+      } finally {
+        await instance.dispose();
+        rmSync(fx.command, { force: true });
+        rmSync(join(fx.command, ".."), { recursive: true, force: true });
+      }
+    }, 40_000);
   });
 
   it("completes the turn when a question goes unanswered, without tainting the final answer", async () => {
@@ -469,6 +847,61 @@ describe("createOpenAIChatRuntime tool approvals", () => {
       await instance.dispose();
     }
   }, 20_000);
+  describe("denial replay guard", () => {
+    it("asks approval once for a denied call, even when retried with a new id", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "omb-deny-replay-"));
+      mcpDir.push(dir);
+      const receipt = join(dir, "calls.txt");
+      const events: RuntimeEvent[] = [];
+      const instance = await OpenAICompatDriver.create({
+        instanceId: "deny-replay",
+        displayName: "Denial replay fixture",
+        enabled: true,
+        environment: { K: "secret" },
+        config: OpenAICompatDriver.decodeConfig({ url: "https://api.example.test/v1", apiKeyEnv: "K", model: "fixture" }),
+      });
+      instance.adapter.onEvent((event) => events.push(event));
+      const bodies: Array<{ messages: Array<{ role: string; content: unknown }> }> = [];
+      const firstPayload = JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "first", type: "function", function: { name: "fx_write", arguments: "{}" } }] } }] });
+      const first = `data: ${firstPayload}\n\ndata: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n`;
+      const secondPayload = JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "second", type: "function", function: { name: "fx_write", arguments: "{}" } }] } }] });
+      const second = `data: ${secondPayload}\n\ndata: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n`;
+      const last = `data: {"choices":[{"index":0,"delta":{"content":"Finished."}}]}\n\ndata: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n`;
+      vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        if (!String(input).endsWith("/chat/completions")) return new Response(JSON.stringify({ data: [] }));
+        bodies.push(JSON.parse(String(init?.body)));
+        return new Response(bodies.length === 1 ? first : bodies.length === 2 ? second : last, { headers: { "content-type": "text/event-stream" } });
+      }));
+      try {
+        await instance.adapter.sendTurn({
+          threadId: "deny-replay",
+          text: "Write the file once.",
+          approvalMode: "ask",
+          toolScope: { allow: ["mcp:fx:write"] },
+          integrations: { custom: { fx: toolServer(receipt) } },
+        });
+        await vi.waitFor(() => {
+          const cards = events.filter((e) => e.type === "request.opened" && e.requestType === "permission");
+          expect(cards).toHaveLength(1);
+        }, { timeout: 10_000 });
+        const card = events.find((e) => e.type === "request.opened" && e.requestType === "permission");
+        if (!card || card.type !== "request.opened" || typeof card.requestId !== "string") throw new Error("Expected the permission request");
+        await instance.adapter.respondToRequest("deny-replay", card.requestId, { behavior: "deny" });
+        await vi.waitFor(() => expect(events.some(e => e.type === "turn.completed")).toBe(true), { timeout: 10_000 });
+        expect(events.find(e => e.type === "turn.completed")).toMatchObject({ ok: false, stopReason: "tool_error" });
+        let receiptText = "";
+        try { receiptText = readFileSync(receipt, "utf8"); } catch { /* never executed */ }
+        expect(receiptText).toBe("");
+        const denied = events.filter((e) => {
+          const ev = e as { itemType?: string; ok?: boolean; output?: unknown };
+          return e.type === "item.completed" && ev.itemType === "tool" && ev.ok === false;
+        });
+        expect(denied.length).toBe(2);
+      } finally {
+        await instance.dispose();
+      }
+    }, 20_000);
+  });
 });
 
 describe("createOpenAIChatRuntime mid-turn steer", () => {
@@ -625,7 +1058,7 @@ describe("createOpenAIChatRuntime mid-turn steer", () => {
     await vi.waitFor(() => {
       if (bodies.length < 1) throw new Error("first request not sent yet");
     }, { timeout: 10_000 });
-    const aside = "[aside from @Peer — peer context, not steering]\nheads up\n[end aside]";
+    const aside = "[aside from @Peer â€” peer context, not steering]\nheads up\n[end aside]";
     await expect(instance.adapter.steer!("t", aside)).resolves.toBe("steered");
     await expect(instance.adapter.steer!("t", "second aside")).resolves.toBe("steered");
     release(new Response(toolCallBody, { status: 200, headers: { "content-type": "text/event-stream" } }));
@@ -731,6 +1164,16 @@ describe("createOpenAIChatRuntime stream termination", () => {
     );
     expect(events.find((event) => event.type === "item.completed")).toMatchObject({ text: "Hello" });
     expect(events.find((event) => event.type === "runtime.error")).toBeUndefined();
+    expect(events.at(-1)).toMatchObject({ type: "turn.completed", ok: true });
+  });
+
+  it("finishes a plain reply from a relay that adds an empty legacy function_call", async () => {
+    const events = await runTurn(
+      'data: {"choices":[{"index":0,"delta":{"content":"OK","function_call":{"name":"","arguments":""}}}]}\n\n'
+        + 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+    );
+    expect(events.find((event) => event.type === "runtime.error")).toBeUndefined();
+    expect(events.find((event) => event.type === "item.completed")).toMatchObject({ text: "OK" });
     expect(events.at(-1)).toMatchObject({ type: "turn.completed", ok: true });
   });
 
@@ -842,6 +1285,28 @@ describe("createOpenAIChatRuntime refused tool calls", () => {
     expect(events.find((event) => event.type === "runtime.error")?.message).toMatch(/^The model tried to use a tool it was not given \("JSON"\)/);
   });
 
+  // oMLX's in-stream frame when a local model writes a tool call it cannot parse.
+  const omlxFailure = (code: string) => sse(`data: ${JSON.stringify({ error: {
+    message: "Model output contains an unrecoverable tool call. Previously delivered tool calls must not be executed again on retry.",
+    type: "server_error", param: null, code,
+  } })}\n\ndata: [DONE]\n\n`);
+
+  it.each(["invalid_tool_call", "incomplete_tool_call"])("sends the request again when oMLX reports %s mid-stream", async (code) => {
+    let requests = 0;
+    const events = await runTurn(() => ++requests === 1 ? omlxFailure(code) : answer());
+    expect(requests).toBe(2);
+    expect(events.find((event) => event.type === "turn.retrying")).toMatchObject({ attempt: 1, delayMs: 0, reason: "tool_use_failed" });
+    expect(events.some((event) => event.type === "runtime.error")).toBe(false);
+    expect(events.at(-1)).toMatchObject({ type: "turn.completed", ok: true });
+  });
+
+  it("stops after three oMLX tool call failures and says nothing ran", async () => {
+    let requests = 0;
+    const events = await runTurn(() => (requests++, omlxFailure("invalid_tool_call")));
+    expect(requests).toBe(3);
+    expect(events.find((event) => event.type === "runtime.error")?.message).toMatch(/^The model made a tool call the provider rejected\. Nothing ran\./);
+  });
+
   it("does not resend other provider errors", async () => {
     let requests = 0;
     const events = await runTurn(() => (requests++, sse(`data: ${JSON.stringify({ error: { ...refusal, code: "invalid_request_error" } })}\n\n`)));
@@ -950,3 +1415,4 @@ describe("createOpenAIChatRuntime rejected keys", () => {
     await instance.dispose();
   });
 });
+  
