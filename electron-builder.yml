@@ -1,6 +1,6 @@
-appId: com.openmausbot.app
-productName: OpenMausBot
-artifactName: OpenMausBot-${version}-${arch}.${ext}
+appId: com.local.mausbot.dev
+productName: MausBot Dev
+artifactName: MausBot-Dev-${version}-${arch}.${ext}
 
 protocols:
   - name: OpenMausBot package install
@@ -15,8 +15,8 @@ protocols:
 # stranded on its installed version.
 publish:
   - provider: github
-    owner: milind-soni
-    repo: OpenMausBot
+    owner: tristandcusi-creator
+    repo: parsimony
 
 directories:
   buildResources: build

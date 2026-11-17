@@ -1,5 +1,11 @@
 # Self-hosting the MausBot server
 
+Parsimony/MausBot Dev uses `~/.mausbot-dev` and port `8899` by default.
+Its desktop profile remains `mausbot-dev` under the OS application-data folder.
+`OMB_DATA_DIR` and `OMB_PORT` can override these defaults. Original MausBot's
+`~/.openmausbot` and legacy `~/.opengumbot` folders are never migrated automatically.
+The upstream examples below use the original app's paths and port.
+
 To keep MausBot and its agents on your current computer and use a VPS only as a
 botâ€™s remote desktop, see [Bring Your Own VPS](byo-vps.md) and the
 [published setup guide](https://docs.openmausbot.com/docs/computers/byo-vps).

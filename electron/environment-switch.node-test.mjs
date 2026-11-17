@@ -63,7 +63,7 @@ test("missing parent dir: aborts with unavailable, rolls back, never persists", 
   const { dir, cleanup } = realDir();
   t.after(cleanup);
   const { calls, args, deps } = makeDeps();
-  const result = await switchLocalEnvironment({ targetDir: join(dir, "gone", ".openmausbot-x"), deps });
+  const result = await switchLocalEnvironment({ targetDir: join(dir, "gone", ".openmausbot-x"), port: 8799, deps });
   assert.deepEqual(result, { ok: false, error: "unavailable", rolledBack: true });
   assert.deepEqual(calls, ["stop", "release", "rollback"]);
   assert.deepEqual(args.rollback, [[8799]]);

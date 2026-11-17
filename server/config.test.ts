@@ -52,6 +52,32 @@ import { cacheUntilConfigChanges,
   type AppConfig,
 } from "./config.ts";
 
+it("keeps fork data separate from original and legacy MausBot data", () => {
+  const home = mkdtempSync(join(tmpdir(), "parsimony-profile-"));
+  try {
+    for (const folder of [".openmausbot", ".opengumbot"]) {
+      mkdirSync(join(home, folder));
+      writeFileSync(join(home, folder, "keep.txt"), folder);
+    }
+    const moduleUrl = pathToFileURL(join(import.meta.dirname, "config.ts")).href;
+    for (const override of [undefined, "", join(home, "custom")]) {
+      const env: NodeJS.ProcessEnv = { ...process.env, USERPROFILE: home, HOME: home };
+      delete env.VITEST;
+      if (override === undefined) delete env.OMB_DATA_DIR;
+      else env.OMB_DATA_DIR = override;
+      // A fresh process avoids reusing this test runner's already-selected data root.
+      const result = execFileSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e",
+        `const { DATA_DIR, ensureDirs } = await import(${JSON.stringify(moduleUrl)}); ensureDirs(); console.log(JSON.stringify(DATA_DIR));`,
+      ], { env, encoding: "utf8" });
+      expect(JSON.parse(result.trim())).toBe(override || join(home, ".mausbot-dev"));
+    }
+    for (const folder of [".openmausbot", ".opengumbot"]) {
+      expect(readFileSync(join(home, folder, "keep.txt"), "utf8")).toBe(folder);
+    }
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
 const reloaded = (patch: object, cfg: AppConfig = {}) =>
   changedInstanceIds(engineLaunches(instanceConfigs(cfg), {}), engineLaunches(instanceConfigs({ ...cfg, ...patch } as AppConfig), {}));
 
